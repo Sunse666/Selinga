@@ -1,6 +1,10 @@
 use clap::{Parser, Subcommand};
-use selinga_capture::{Region, ScreenCapture};
+use selinga_capture::Region;
+#[cfg(windows)]
+use selinga_capture::ScreenCapture;
+#[cfg(windows)]
 use selinga_ocr::Ocr;
+#[cfg(windows)]
 use selinga_translate::Translator;
 
 #[derive(Parser)]
@@ -131,6 +135,7 @@ fn run_capture_ocr(
     }
 }
 
+#[cfg(windows)]
 fn write_bmp(path: &str, frame: &selinga_capture::Frame) -> std::io::Result<()> {
     use std::io::Write;
 
