@@ -150,6 +150,7 @@ enum WorkerMsg {
 
 impl SelingaApp {
     fn new() -> Self {
+        #[cfg(windows)]
         let (tx, rx) = std::sync::mpsc::channel();
         let saved = Settings::load();
         let target_lang = TARGET_LANGS
