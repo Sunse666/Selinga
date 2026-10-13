@@ -5,7 +5,9 @@ use selinga_capture::ScreenCapture;
 use selinga_ocr::Ocr;
 use selinga_pipeline::PipelineOutput;
 use selinga_translate::Translator;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(windows)]
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 mod settings;
@@ -39,6 +41,7 @@ fn build_translator(target: &str) -> Arc<dyn Translator> {
 
 type ToolbarAction = Box<dyn Fn(&mut SelingaApp, &egui::Ui)>;
 
+#[cfg(windows)]
 #[derive(Debug, Clone)]
 struct FrameCache {
     hash: u64,
@@ -128,6 +131,7 @@ struct SelingaApp {
     translate_error: Option<String>,
     target_lang: usize,
     translator: Arc<std::sync::RwLock<Arc<dyn Translator>>>,
+    #[cfg(windows)]
     cache: Arc<Mutex<Option<FrameCache>>>,
     #[cfg(windows)]
     worker: Option<Worker>,
@@ -178,6 +182,7 @@ impl SelingaApp {
             translator: Arc::new(std::sync::RwLock::new(build_translator(
                 TARGET_LANGS[target_lang],
             ))),
+            #[cfg(windows)]
             cache: Arc::new(Mutex::new(None)),
             #[cfg(windows)]
             worker: Some(Worker { tx, rx }),
