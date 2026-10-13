@@ -1,0 +1,18 @@
+[package]
+name = "selinga-cli"
+description = "Selinga debug CLI (capture-ocr feasibility loop)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "selinga-cli"
+path = "src/main.rs"
+
+[dependencies]
+selinga-capture.workspace = true
+selinga-ocr.workspace = true
+selinga-platform.workspace = true
+selinga-translate.workspace = true
+clap.workspace = true

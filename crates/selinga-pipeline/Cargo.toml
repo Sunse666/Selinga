@@ -1,0 +1,12 @@
+[package]
+name = "selinga-pipeline"
+description = "Selinga recognition pipeline (debounce, capture, OCR, translate)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+selinga-capture.workspace = true
+selinga-ocr.workspace = true
+selinga-translate.workspace = true

@@ -1,0 +1,61 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/selinga-app",
+    "crates/selinga-cli",
+    "crates/selinga-capture",
+    "crates/selinga-ocr",
+    "crates/selinga-overlay-ui",
+    "crates/selinga-pipeline",
+    "crates/selinga-platform",
+    "crates/selinga-translate",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Sunse666"]
+license = "MIT"
+
+[workspace.dependencies]
+selinga-capture = { path = "crates/selinga-capture" }
+selinga-ocr = { path = "crates/selinga-ocr" }
+selinga-translate = { path = "crates/selinga-translate" }
+selinga-platform = { path = "crates/selinga-platform" }
+selinga-pipeline = { path = "crates/selinga-pipeline" }
+selinga-overlay-ui = { path = "crates/selinga-overlay-ui" }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+# glow-only: eframe's default `wgpu` feature breaks against windows 0.61
+# (wgpu-hal D3D12 bindings need a newer windows crate).
+eframe = { version = "0.34", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+ureq = { version = "2", features = ["json"] }
+futures = "0.3"
+thiserror = "2"
+windows = { version = "0.61", features = [
+    "Foundation",
+    "Globalization",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Security_Cryptography",
+    "Storage_Streams",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.dev]
+# rustc 1.97.1 x86_64-pc-windows-gnu hits an incremental-compilation ICE
+# when building this workspace for `cargo test`; disable until fixed.
+incremental = false
+
+[profile.release]
+lto = "thin"
+strip = true

@@ -1,0 +1,22 @@
+[package]
+name = "selinga-app"
+description = "Selinga application shell (overlay window)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "selinga"
+path = "src/main.rs"
+
+[dependencies]
+selinga-capture.workspace = true
+selinga-ocr.workspace = true
+selinga-translate.workspace = true
+selinga-platform.workspace = true
+selinga-pipeline.workspace = true
+eframe.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

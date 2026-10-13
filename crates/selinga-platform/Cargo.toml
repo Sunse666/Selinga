@@ -1,0 +1,10 @@
+[package]
+name = "selinga-platform"
+description = "Selinga platform integration helpers (hotkeys, permissions, DPI)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

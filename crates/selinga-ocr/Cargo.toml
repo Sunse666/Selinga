@@ -1,0 +1,14 @@
+[package]
+name = "selinga-ocr"
+description = "Selinga OCR abstraction and backends"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+selinga-capture.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

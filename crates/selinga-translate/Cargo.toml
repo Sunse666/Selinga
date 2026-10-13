@@ -1,0 +1,12 @@
+[package]
+name = "selinga-translate"
+description = "Selinga translation abstraction and backends"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
