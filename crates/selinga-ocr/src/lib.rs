@@ -1,6 +1,7 @@
 use selinga_capture::Frame;
 use thiserror::Error;
 
+#[cfg(windows)]
 pub mod win32;
 
 #[derive(Debug, Clone, Copy)]
