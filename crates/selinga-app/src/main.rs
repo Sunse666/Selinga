@@ -4,7 +4,6 @@ use selinga_capture::ScreenCapture;
 #[cfg(windows)]
 use selinga_ocr::Ocr;
 use selinga_pipeline::PipelineOutput;
-#[cfg(windows)]
 use selinga_translate::Translator;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
