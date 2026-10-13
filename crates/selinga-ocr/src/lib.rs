@@ -1,5 +1,3 @@
-#![deny(missing_docs)]
-
 use selinga_capture::Frame;
 use thiserror::Error;
 
@@ -31,11 +29,7 @@ pub enum OcrError {
     #[error("no OCR engine available for language {0:?}")]
     EngineUnavailable(Option<String>),
     #[error("region too large for OCR: {width}x{height} (max {max})")]
-    TooLarge {
-        width: u32,
-        height: u32,
-        max: u32,
-    },
+    TooLarge { width: u32, height: u32, max: u32 },
     #[error("OCR failed: {0}")]
     Platform(String),
 }

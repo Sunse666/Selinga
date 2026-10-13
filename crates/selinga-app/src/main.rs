@@ -6,6 +6,9 @@ use selinga_translate::Translator;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod settings;
+use settings::Settings;
+
 const DEBOUNCE: Duration = Duration::from_millis(700);
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 const EXCLUDE_INTERVAL: Duration = Duration::from_secs(1);
@@ -146,8 +149,17 @@ enum WorkerMsg {
 impl SelingaApp {
     fn new() -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
+        let saved = Settings::load();
+        let target_lang = TARGET_LANGS
+            .iter()
+            .position(|l| *l == saved.target_lang)
+            .unwrap_or(0);
+        let display_mode = match saved.display_mode.as_str() {
+            "bilingual" => DisplayMode::Bilingual,
+            _ => DisplayMode::Translation,
+        };
         Self {
-            paused: false,
+            paused: saved.paused,
             busy: false,
             dragging: false,
             resizing: None,
@@ -155,16 +167,30 @@ impl SelingaApp {
             stable_since: None,
             last_trigger: None,
             last_exclude: Instant::now(),
-            display_mode: DisplayMode::Translation,
+            display_mode,
             copied_at: None,
             result: None,
             translate_error: None,
-            target_lang: 0,
-            translator: Arc::new(std::sync::RwLock::new(build_translator(TARGET_LANGS[0]))),
+            target_lang,
+            translator: Arc::new(std::sync::RwLock::new(build_translator(
+                TARGET_LANGS[target_lang],
+            ))),
             cache: Arc::new(Mutex::new(None)),
             #[cfg(windows)]
             worker: Some(Worker { tx, rx }),
         }
+    }
+
+    fn persist_settings(&self) {
+        Settings {
+            target_lang: TARGET_LANGS[self.target_lang].to_owned(),
+            display_mode: match self.display_mode {
+                DisplayMode::Translation => "translation".to_owned(),
+                DisplayMode::Bilingual => "bilingual".to_owned(),
+            },
+            paused: self.paused,
+        }
+        .save();
     }
 }
 
@@ -280,6 +306,7 @@ impl SelingaApp {
                 mode_label,
                 Box::new(|app: &mut Self, ui: &egui::Ui| {
                     app.display_mode = app.display_mode.toggle();
+                    app.persist_settings();
                     ui.ctx().request_repaint();
                 }),
             ),
@@ -306,6 +333,7 @@ impl SelingaApp {
                     if let Ok(mut g) = app.translator.write() {
                         *g = build_translator(target);
                     }
+                    app.persist_settings();
                 }),
             ),
             (
@@ -323,6 +351,7 @@ impl SelingaApp {
                 if self.paused { "resume" } else { "pause" }.to_owned(),
                 Box::new(|app: &mut Self, _ui: &egui::Ui| {
                     app.paused = !app.paused;
+                    app.persist_settings();
                 }),
             ),
         ];

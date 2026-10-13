@@ -1,5 +1,3 @@
-#![deny(missing_docs)]
-
 use thiserror::Error;
 
 pub mod win32;

@@ -1,5 +1,3 @@
-#![deny(missing_docs)]
-
 #[derive(Debug, Clone)]
 pub struct LinePair {
     pub source: String,

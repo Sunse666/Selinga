@@ -26,6 +26,8 @@ selinga-pipeline = { path = "crates/selinga-pipeline" }
 selinga-overlay-ui = { path = "crates/selinga-overlay-ui" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
 # glow-only: eframe's default `wgpu` feature breaks against windows 0.61
 # (wgpu-hal D3D12 bindings need a newer windows crate).
 eframe = { version = "0.34", default-features = false, features = [

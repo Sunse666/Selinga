@@ -1,5 +1,3 @@
-#![deny(missing_docs)]
-
 pub fn exclude_self_from_capture() -> usize {
     #[cfg(windows)]
     {

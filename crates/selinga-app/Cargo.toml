@@ -17,6 +17,8 @@ selinga-translate.workspace = true
 selinga-platform.workspace = true
 selinga-pipeline.workspace = true
 eframe.workspace = true
+serde.workspace = true
+toml.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true

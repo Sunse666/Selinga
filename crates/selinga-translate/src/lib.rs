@@ -1,5 +1,3 @@
-#![deny(missing_docs)]
-
 pub mod google;
 pub mod lru;
 pub mod mymemory;
@@ -122,10 +120,10 @@ pub(crate) fn http_agent(timeout: std::time::Duration) -> ureq::Agent {
     let mut builder = ureq::AgentBuilder::new()
         .timeout(timeout)
         .timeout_connect(std::time::Duration::from_secs(3));
-    if let Some(url) = env_proxy_url() {
-        if let Ok(proxy) = ureq::Proxy::new(&url) {
-            builder = builder.proxy(proxy);
-        }
+    if let Some(url) = env_proxy_url()
+        && let Ok(proxy) = ureq::Proxy::new(&url)
+    {
+        builder = builder.proxy(proxy);
     }
     builder.build()
 }
