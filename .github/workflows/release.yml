@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: selinga.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: selinga-linux
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: selinga-macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+          rustup target add ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p selinga-app
+      - name: Stage artifact
+        shell: bash
+        run: |
+          cp "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "${{ matrix.artifact }}"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: selinga-${{ matrix.target }}
+          path: ${{ matrix.artifact }}
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}
