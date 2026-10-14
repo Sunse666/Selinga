@@ -6,6 +6,40 @@ pub struct Settings {
     pub target_lang: String,
     pub display_mode: String,
     pub paused: bool,
+    #[serde(default = "VlmSettings::disabled")]
+    pub vlm: VlmSettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VlmSettings {
+    pub enabled: bool,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+}
+
+impl VlmSettings {
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            base_url: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+        }
+    }
+
+    pub fn config(&self) -> Option<selinga_translate::vlm::VlmConfig> {
+        if !self.enabled || self.base_url.trim().is_empty() || self.model.trim().is_empty() {
+            return None;
+        }
+        Some(selinga_translate::vlm::VlmConfig {
+            base_url: self.base_url.trim().to_owned(),
+            api_key: Some(self.api_key.trim())
+                .filter(|k| !k.is_empty())
+                .map(str::to_owned),
+            model: self.model.trim().to_owned(),
+        })
+    }
 }
 
 impl Default for Settings {
@@ -14,6 +48,7 @@ impl Default for Settings {
             target_lang: "zh-CN".to_owned(),
             display_mode: "translation".to_owned(),
             paused: false,
+            vlm: VlmSettings::disabled(),
         }
     }
 }
@@ -77,6 +112,7 @@ mod tests {
             target_lang: "ja-JP".to_owned(),
             display_mode: "bilingual".to_owned(),
             paused: true,
+            vlm: VlmSettings::disabled(),
         };
         s.save_to(&path);
         assert_eq!(Settings::load_from(&path), Some(s));
@@ -98,6 +134,7 @@ mod tests {
             target_lang: "xx-XX".to_owned(),
             display_mode: "translation".to_owned(),
             paused: false,
+            vlm: VlmSettings::disabled(),
         };
         s.save_to(&path);
         assert_eq!(Settings::load_from(&path), None);
@@ -111,6 +148,7 @@ mod tests {
             target_lang: "zh-CN".to_owned(),
             display_mode: "side-by-side".to_owned(),
             paused: false,
+            vlm: VlmSettings::disabled(),
         };
         s.save_to(&path);
         assert_eq!(Settings::load_from(&path), None);
@@ -122,6 +160,49 @@ mod tests {
         let path = temp_path("missing");
         let _ = std::fs::remove_file(&path);
         assert_eq!(Settings::load_from(&path), None);
+    }
+
+    #[test]
+    fn missing_vlm_section_defaults_to_disabled() {
+        let path = temp_path("vlm-missing");
+        std::fs::write(
+            &path,
+            "target_lang = \"zh-CN\"\ndisplay_mode = \"translation\"\npaused = false\n",
+        )
+        .unwrap();
+        let s = Settings::load_from(&path).unwrap();
+        assert!(!s.vlm.enabled);
+        assert_eq!(s.vlm.config(), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn vlm_section_parses_into_config() {
+        let path = temp_path("vlm-parse");
+        std::fs::write(
+            &path,
+            "target_lang = \"zh-CN\"\ndisplay_mode = \"translation\"\npaused = false\n\n[vlm]\nenabled = true\nbase_url = \"http://localhost:11434/v1\"\napi_key = \"\"\nmodel = \"qwen2.5:7b\"\n",
+        )
+        .unwrap();
+        let s = Settings::load_from(&path).unwrap();
+        let cfg = s.vlm.config().unwrap();
+        assert_eq!(cfg.base_url, "http://localhost:11434/v1");
+        assert_eq!(cfg.model, "qwen2.5:7b");
+        assert_eq!(cfg.api_key, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn vlm_enabled_without_fields_yields_none() {
+        let path = temp_path("vlm-empty");
+        std::fs::write(
+            &path,
+            "target_lang = \"zh-CN\"\ndisplay_mode = \"translation\"\npaused = false\n\n[vlm]\nenabled = true\nbase_url = \"\"\napi_key = \"\"\nmodel = \"\"\n",
+        )
+        .unwrap();
+        let s = Settings::load_from(&path).unwrap();
+        assert_eq!(s.vlm.config(), None);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(60);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VlmConfig {
     pub base_url: String,
     pub api_key: Option<String>,

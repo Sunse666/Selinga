@@ -21,4 +21,6 @@ serde.workspace = true
 toml.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+global-hotkey = "0.8.0"
+tray-icon = "0.26.1"
 windows.workspace = true

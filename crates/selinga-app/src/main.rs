@@ -11,7 +11,11 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 mod settings;
+#[cfg(windows)]
+mod tray;
 use settings::Settings;
+#[cfg(windows)]
+use tray::{Tray, TrayCommand};
 
 const DEBOUNCE: Duration = Duration::from_millis(700);
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
@@ -26,15 +30,26 @@ const LINE_PAD: f32 = 3.0;
 const BILINGUAL_EXTRA: f32 = 0.62;
 const TARGET_LANGS: [&str; 4] = ["zh-CN", "en-US", "ja-JP", "ko-KR"];
 
-fn build_translator(target: &str) -> Arc<dyn Translator> {
+fn build_translator(
+    target: &str,
+    vlm: Option<&selinga_translate::vlm::VlmConfig>,
+) -> Arc<dyn Translator> {
+    let mut backends: Vec<Box<dyn Translator>> = vec![Box::new(
+        selinga_translate::tencent::TransmartTranslator::new(target),
+    )];
+    if let Some(cfg) = vlm {
+        backends.push(Box::new(selinga_translate::vlm::VlmTranslator::new(
+            cfg.clone(),
+        )));
+    }
+    backends.push(Box::new(selinga_translate::google::GoogleTranslator::new(
+        target,
+    )));
+    backends.push(Box::new(
+        selinga_translate::mymemory::MyMemoryTranslator::new("en-US", target),
+    ));
     Arc::new(selinga_translate::CachedTranslator::new(
-        selinga_translate::FallbackTranslator::new(vec![
-            Box::new(selinga_translate::tencent::TransmartTranslator::new(target)),
-            Box::new(selinga_translate::google::GoogleTranslator::new(target)),
-            Box::new(selinga_translate::mymemory::MyMemoryTranslator::new(
-                "en-US", target,
-            )),
-        ]),
+        selinga_translate::FallbackTranslator::new(backends),
         2048,
     ))
 }
@@ -131,6 +146,10 @@ struct SelingaApp {
     translate_error: Option<String>,
     target_lang: usize,
     translator: Arc<std::sync::RwLock<Arc<dyn Translator>>>,
+    vlm: settings::VlmSettings,
+    hidden: bool,
+    #[cfg(windows)]
+    tray: Option<Tray>,
     #[cfg(windows)]
     cache: Arc<Mutex<Option<FrameCache>>>,
     #[cfg(windows)]
@@ -179,9 +198,14 @@ impl SelingaApp {
             result: None,
             translate_error: None,
             target_lang,
+            hidden: false,
+            vlm: saved.vlm.clone(),
             translator: Arc::new(std::sync::RwLock::new(build_translator(
                 TARGET_LANGS[target_lang],
+                saved.vlm.config().as_ref(),
             ))),
+            #[cfg(windows)]
+            tray: Tray::new().ok(),
             #[cfg(windows)]
             cache: Arc::new(Mutex::new(None)),
             #[cfg(windows)]
@@ -197,6 +221,7 @@ impl SelingaApp {
                 DisplayMode::Bilingual => "bilingual".to_owned(),
             },
             paused: self.paused,
+            vlm: self.vlm.clone(),
         }
         .save();
     }
@@ -224,6 +249,7 @@ impl eframe::App for SelingaApp {
             .unwrap_or(Duration::ZERO);
 
         self.drain_worker(&ctx);
+        self.drain_tray(&ctx);
         self.draw_box(ui, &ctx);
 
         let pointer_idle = !ctx.input(|i| i.pointer.any_down());
@@ -235,6 +261,7 @@ impl eframe::App for SelingaApp {
         if (debounce_due || poll_due)
             && pointer_idle
             && !self.paused
+            && !self.hidden
             && !self.busy
             && !self.dragging
             && self.resizing.is_none()
@@ -339,7 +366,7 @@ impl SelingaApp {
                     app.target_lang = (app.target_lang + 1) % TARGET_LANGS.len();
                     let target = TARGET_LANGS[app.target_lang];
                     if let Ok(mut g) = app.translator.write() {
-                        *g = build_translator(target);
+                        *g = build_translator(target, app.vlm.config().as_ref());
                     }
                     app.persist_settings();
                 }),
@@ -584,6 +611,44 @@ impl SelingaApp {
         ));
         self.busy = false;
     }
+
+    #[cfg(windows)]
+    fn drain_tray(&mut self, ctx: &egui::Context) {
+        let commands = match &self.tray {
+            Some(tray) => tray.drain(),
+            None => return,
+        };
+        for cmd in commands {
+            match cmd {
+                TrayCommand::ToggleHidden => {
+                    self.hidden = !self.hidden;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(!self.hidden));
+                    if let Some(tray) = &self.tray {
+                        tray.set_hidden_label(self.hidden);
+                    }
+                }
+                TrayCommand::TogglePause => {
+                    self.paused = !self.paused;
+                    self.persist_settings();
+                    if let Some(tray) = &self.tray {
+                        tray.set_paused_label(self.paused);
+                    }
+                }
+                TrayCommand::Refresh => {
+                    if !self.busy
+                        && let Some(rect) = self.last_rect
+                    {
+                        let ppp = ctx.native_pixels_per_point().unwrap_or(1.0);
+                        self.trigger(ctx, rect, ppp, true);
+                    }
+                }
+                TrayCommand::Quit => std::process::exit(0),
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn drain_tray(&mut self, _ctx: &egui::Context) {}
 
     #[cfg(windows)]
     fn drain_worker(&mut self, ctx: &egui::Context) {
