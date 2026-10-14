@@ -1,28 +1,98 @@
 # Selinga
 
-**Sel**ect + **Lingo** — 跨平台屏幕翻译工具：一个可拖动的透明方框，框内内容自动 OCR 并翻译。
+**Sel**ect + **Lingo** — 一个可拖动的透明方框，框住屏幕任意区域，内容自动离线 OCR 并翻译，译文直接覆盖显示。
 
-## 技术栈
+## 功能
 
-- Rust (stable) + egui/winit
-- OCR：系统级离线 OCR（Windows.Media.Ocr；macOS Apple Vision / Linux PaddleOCR ONNX 预留）
-- 翻译：`Translator` trait 多后端（Google 免费端点起步）
+- **拖框即译**：方框拖到哪译到哪；内容变化自动重新识别，静止内容走帧哈希 + LRU 双层缓存，零重复开销
+- **离线 OCR**：Windows.Media.Ocr 系统级识别（中文/英文/日文等，随系统语言包），不上传画面
+- **多后端翻译链**：腾讯 TranSmart（免 key 国内直连）→ Google → MyMemory，自动降级，失败不卡 UI
+- **VLM 增强（可选）**：接入任意 OpenAI 兼容端点（云端 API 或本地 Ollama）提升翻译质量
+- **双语对照 / 纯译文**两种显示模式，字号自适应，一键复制
+- **系统托盘 + 全局热键**：方框不在焦点也能控制
+- **设置持久化**：目标语言、显示模式、暂停状态存 TOML，重启保留
+- **零依赖分发**：单文件可执行程序，无需安装运行时
+
+## 快捷键与托盘
+
+| 操作 | 热键 | 托盘菜单 |
+|---|---|---|
+| 隐藏 / 显示方框 | `Ctrl+Alt+H` | 隐藏方框 |
+| 暂停 / 恢复识别 | `Ctrl+Alt+P` | 暂停识别 |
+| 强制重新识别 | 方框工具栏 `refresh` | 重新识别 |
+| 退出 | — | 退出 |
+
+方框悬停时出现工具栏：`mode`（译文/双语切换）、`copy`（复制结果）、`to: xx`（目标语言循环切换）、`refresh`、`pause`。
+
+## 安装
+
+从 [Releases](../../releases) 下载对应平台的单文件程序（Windows `selinga.exe`），直接运行即可。
+
+从源码构建：
+
+```bash
+git clone https://github.com/Sunse666/Selinga.git
+cd Selinga
+cargo build --release -p selinga-app
+# 产物：target/release/selinga.exe
+```
+
+要求 Rust 1.97.1（见 `rust-toolchain.toml`，cargo 会自动拉取）。
+
+## 设置
+
+配置文件位于 `%APPDATA%\selinga\settings.toml`（Windows）或 `~/.config/selinga/settings.toml`（Linux/macOS），程序运行时自动维护；启用 VLM 需手动追加：
+
+```toml
+[vlm]
+enabled = true
+base_url = "http://localhost:11434/v1"   # OpenAI 兼容端点，本地 Ollama 示例
+api_key = ""                              # 云端服务才需要；留空 = 无鉴权
+model = "qwen2.5:7b"
+```
+
+保存后重启生效。VLM 在翻译链中排第二级（TranSmart → **VLM** → Google → MyMemory），后端失败自动降级，不影响可用性。
+
+## 命令行调试工具
+
+```bash
+cargo run -p selinga-cli -- capture-ocr --region 100,200,800,400
+cargo run -p selinga-cli -- capture-ocr --region 100,200,800,400 --lang zh-CN --boxes
+cargo run -p selinga-cli -- capture-ocr --region 100,200,800,400 --translate --tl zh-CN
+```
+
+## 平台支持
+
+| 平台 | 状态 |
+|---|---|
+| Windows | ✅ 完整功能（GDI 截屏 + Windows.Media.Ocr） |
+| Linux / macOS | 编译通过，覆盖层功能开发中 |
+
+## 架构
+
+8-crate workspace：
+
+```
+selinga-capture     GDI 区域截屏（物理像素，DPI 感知）
+selinga-ocr         Windows.Media.Ocr 封装 + 识别增强管线（反色/对比度/二值化/拆字重试/双通道）
+selinga-translate   Translator trait + TranSmart/Google/MyMemory/VLM 后端 + LRU 缓存 + 降级链
+selinga-pipeline    OCR 行与译文的结构化配对
+selinga-platform    截屏自我排除（WDA_EXCLUDEFROMCAPTURE）
+selinga-overlay-ui  覆盖层渲染原语
+selinga-app         egui 覆盖层主程序（托盘/热键/触发调度/设置持久化）
+selinga-cli         调试 CLI
+```
 
 ## 开发
 
-参见 [DEVELOPMENT.md](DEVELOPMENT.md)（注释/Git/CI 规范与里程碑）。
-
 ```bash
-cargo build --workspace
-cargo test --workspace
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-## M0 调试工具
+推送 `main` 自动跑 CI（三平台 fmt/clippy/test/build）；推 `v*` tag 自动构建三平台产物并发布到 Releases。
 
-```bash
-# 截取屏幕区域（物理像素）并输出 OCR 文本
-selinga-cli capture-ocr --region 100,200,800,400
-selinga-cli capture-ocr --region 100,200,800,400 --lang zh-CN --boxes
-```
+## License
+
+[MIT](LICENSE)
