@@ -47,8 +47,6 @@ pub fn enable_utf8_console() {
     }
 }
 
-/// 主屏尺寸（逻辑点）。启动框选用它把无边框窗口直接铺满屏幕，
-/// 规避运行时全屏切换带来的渲染表面重建与闪烁。
 pub fn primary_screen_points() -> (f32, f32) {
     #[cfg(windows)]
     unsafe {
@@ -67,7 +65,6 @@ pub fn primary_screen_points() -> (f32, f32) {
     }
 }
 
-/// 主屏物理像素尺寸（框选背景全屏抓图用）
 pub fn primary_screen_px() -> (u32, u32) {
     #[cfg(windows)]
     unsafe {
