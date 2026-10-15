@@ -34,6 +34,45 @@ pub fn exclude_self_from_capture() -> usize {
     }
 }
 
+/// Synchronously move/resize a top-level window found by title, in physical
+/// pixels. Applying the geometry directly (instead of deferring to the native
+/// modal drag loop) lets the caller repaint at the target geometry in the same
+/// frame, so borders never trail behind the cursor. Returns false when the
+/// window was not found or on non-Windows.
+pub fn set_window_geometry_px(title: &str, x: i32, y: i32, w: i32, h: i32) -> bool {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetWindowPos,
+        };
+        let mut wide: Vec<u16> = title.encode_utf16().collect();
+        wide.push(0);
+        let Ok(hwnd) = FindWindowW(windows::core::PCWSTR(wide.as_ptr()), None) else {
+            return false;
+        };
+        if hwnd == HWND::default() {
+            return false;
+        }
+        SetWindowPos(
+            hwnd,
+            Some(HWND::default()), // ignored with SWP_NOZORDER
+            x,
+            y,
+            w.max(1),
+            h.max(1),
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        )
+        .is_ok()
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (title, x, y, w, h);
+        false
+    }
+}
+
 pub fn enable_utf8_console() {
     #[cfg(windows)]
     {

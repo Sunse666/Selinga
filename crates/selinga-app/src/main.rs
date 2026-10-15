@@ -165,6 +165,8 @@ struct SelingaApp {
     busy: bool,
     dragging: bool,
     resizing: Option<egui::ResizeDirection>,
+    drag_anchor: Option<(egui::Pos2, egui::Rect)>,
+    drag_rect: Option<egui::Rect>,
     last_rect: Option<egui::Rect>,
     stable_since: Option<Instant>,
     last_trigger: Option<Instant>,
@@ -231,6 +233,8 @@ impl SelingaApp {
             busy: false,
             dragging: false,
             resizing: None,
+            drag_anchor: None,
+            drag_rect: None,
             last_rect: None,
             stable_since: None,
             last_trigger: None,
@@ -403,7 +407,12 @@ impl SelingaApp {
             let ppp = box_ctx.native_pixels_per_point().unwrap_or(1.0);
 
             #[cfg(windows)]
-            self.update_live_background(&box_ctx, ppp, outer);
+            // While a drag/resize is in flight, per-frame capture reads black
+            // for the area behind a moving excluded window; the frozen
+            // snapshot taken at drag start covers those frames instead.
+            if !self.dragging && self.resizing.is_none() {
+                self.update_live_background(&box_ctx, ppp, outer);
+            }
 
             if outer != self.last_rect {
                 self.last_rect = outer;
@@ -458,25 +467,29 @@ impl SelingaApp {
     }
 
     #[cfg(windows)]
-    fn load_select_background(&mut self, ctx: &egui::Context) {
+    fn capture_screen_texture(&self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
         let (w, h) = selinga_platform::primary_screen_px();
-        let capture = match selinga_capture::win32::GdiCapture::new() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("selinga: bg capture new failed: {e}");
-                return;
-            }
-        };
-        let Ok(frame) = capture.capture_region(selinga_capture::Region { x: 0, y: 0, w, h }) else {
-            eprintln!("selinga: bg capture_region failed");
-            return;
-        };
-        eprintln!("selinga: bg loaded {}x{}", frame.width, frame.height);
+        let capture = selinga_capture::win32::GdiCapture::new().ok()?;
+        let frame = capture
+            .capture_region(selinga_capture::Region { x: 0, y: 0, w, h })
+            .ok()?;
         let image = egui::ColorImage::from_rgba_unmultiplied(
             [frame.width as usize, frame.height as usize],
             &frame.to_rgba(),
         );
-        self.select_bg = Some(ctx.load_texture("select_bg", image, egui::TextureOptions::LINEAR));
+        Some(ctx.load_texture("screen_bg", image, egui::TextureOptions::LINEAR))
+    }
+
+    #[cfg(windows)]
+    fn load_select_background(&mut self, ctx: &egui::Context) {
+        match self.capture_screen_texture(ctx) {
+            Some(tex) => {
+                let s = tex.size_vec2();
+                eprintln!("selinga: bg loaded {}x{}", s.x as u32, s.y as u32);
+                self.select_bg = Some(tex);
+            }
+            None => eprintln!("selinga: bg capture failed"),
+        }
     }
 
     fn draw_frozen_background(&self, ui: &egui::Ui) {
@@ -633,24 +646,54 @@ impl SelingaApp {
     }
 
     fn draw_box(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let rect = ui.max_rect();
+        let max_rect = ui.max_rect();
+        // While a manual drag/resize is in flight the OS window already sits
+        // at the target geometry (SetWindowPos ran synchronously before this
+        // frame paints); paint at that geometry so nothing trails behind.
+        // drag_rect is in SCREEN coordinates (for SetWindowPos and snapshot
+        // sampling); painting and hit-testing must use the window-local
+        // canvas rect of the same size.
+        let rect = match self.drag_rect {
+            Some(r) => egui::Rect::from_min_size(egui::Pos2::ZERO, r.size()),
+            None => max_rect,
+        };
+        let ppp = ctx.native_pixels_per_point().unwrap_or(1.0);
+        let painter = ui.ctx().layer_painter(ui.layer_id());
         #[cfg(windows)]
-        if let Some(tex) = &self.live_bg {
-            ui.painter().image(
-                tex.id(),
-                rect,
-                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
+        {
+            if let Some(tex) = &self.select_bg {
+                // Frozen full-screen snapshot taken at drag start: sample the
+                // exact screen slice the window covers right now (drag_rect
+                // is in screen coordinates) and draw it into the window-local
+                // canvas, so the interior stays see-through while moving (a
+                // live re-capture reads black behind a moving excluded
+                // window).
+                let ts = tex.size_vec2();
+                let uv = match self.drag_rect {
+                    Some(r) => egui::Rect::from_min_max(
+                        egui::pos2(r.min.x * ppp / ts.x, r.min.y * ppp / ts.y),
+                        egui::pos2(r.max.x * ppp / ts.x, r.max.y * ppp / ts.y),
+                    ),
+                    None => egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                };
+                painter.image(tex.id(), rect, uv, egui::Color32::WHITE);
+            } else if let Some(tex) = &self.live_bg {
+                painter.image(
+                    tex.id(),
+                    rect,
+                    egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
         }
-        ui.painter().rect_stroke(
+        painter.rect_stroke(
             rect,
             6.0,
             egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(0x53, 0x4A, 0xB7)),
             egui::StrokeKind::Inside,
         );
 
-        let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+        let resp = ui.allocate_rect(max_rect, egui::Sense::click_and_drag());
         let pointer = ctx.input(|i| i.pointer.clone());
         let pos = pointer.latest_pos();
         let resize_dir = resize_direction(rect, pos);
@@ -674,22 +717,69 @@ impl SelingaApp {
             }
         }
 
+        // Manual drag/resize loop. The native modal loop (StartDrag /
+        // BeginResize) moves the window outline ahead of our GL content,
+        // which reads as a trailing border. Instead, on every frame with the
+        // button held, apply the new rect synchronously via SetWindowPos
+        // before this frame is presented.
+        let outer = ctx.input(|i| i.viewport().outer_rect);
+        let pointer_screen = pos.and_then(|p| outer.map(|o| o.min + p.to_vec2()));
+
         if pointer.primary_pressed() && !toolbar_hovered {
-            self.resizing = resize_dir;
-            if let Some(dir) = resize_dir {
-                ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+            if resize_dir.is_some() {
+                self.resizing = resize_dir;
+            } else if resize_dir.is_none() && resp.hovered() {
+                self.dragging = true;
+            }
+            if self.dragging || self.resizing.is_some() {
+                // Freeze the desktop once; the drag loop samples slices of it
+                // instead of re-capturing behind a moving window.
+                #[cfg(windows)]
+                if self.select_bg.is_none() {
+                    self.select_bg = self.capture_screen_texture(ctx);
+                }
+                if let (Some(ps), Some(o)) = (pointer_screen, outer) {
+                    self.drag_anchor = Some((ps, o));
+                }
             }
         }
-        if pointer.primary_released() {
-            self.resizing = None;
+
+        if (self.dragging || self.resizing.is_some())
+            && pointer.any_down()
+            && let (Some((grab, start)), Some(ps)) = (self.drag_anchor, pointer_screen)
+        {
+            let delta = ps - grab;
+            let next = match self.resizing {
+                Some(dir) => resize_rect(start, delta, dir),
+                None => start.translate(delta),
+            };
+            let applied = selinga_platform::set_window_geometry_px(
+                "Selinga Box",
+                (next.min.x * ppp).round() as i32,
+                (next.min.y * ppp).round() as i32,
+                (next.width() * ppp).round() as i32,
+                (next.height() * ppp).round() as i32,
+            );
+            if !applied {
+                // Non-Windows fallback: deferred commands still track drags.
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(next.min));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(next.size()));
+            }
+            self.drag_rect = Some(next);
+            ctx.request_repaint();
         }
 
-        if pointer.primary_pressed() && resize_dir.is_none() && resp.hovered() && !toolbar_hovered {
-            self.dragging = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-        }
         if pointer.primary_released() {
             self.dragging = false;
+            self.resizing = None;
+            self.drag_anchor = None;
+            self.drag_rect = None;
+            // Drop the frozen snapshot; the per-frame live capture resumes
+            // and converges on the settled geometry.
+            #[cfg(windows)]
+            {
+                self.select_bg = None;
+            }
         }
     }
 
@@ -1334,6 +1424,39 @@ fn resize_direction(rect: egui::Rect, pos: Option<egui::Pos2>) -> Option<egui::R
     } else {
         None
     }
+}
+
+/// Apply a pointer delta to the grabbed edge(s) of `start`, clamping so the
+/// box never shrinks below `MIN_SELECT` on either axis.
+fn resize_rect(start: egui::Rect, delta: egui::Vec2, dir: egui::ResizeDirection) -> egui::Rect {
+    let mut r = start;
+    let west = (start.left() + delta.x).min(start.right() - MIN_SELECT);
+    let east = (start.right() + delta.x).max(start.left() + MIN_SELECT);
+    let north = (start.top() + delta.y).min(start.bottom() - MIN_SELECT);
+    let south = (start.bottom() + delta.y).max(start.top() + MIN_SELECT);
+    match dir {
+        egui::ResizeDirection::North => r.set_top(north),
+        egui::ResizeDirection::South => r.set_bottom(south),
+        egui::ResizeDirection::West => r.set_left(west),
+        egui::ResizeDirection::East => r.set_right(east),
+        egui::ResizeDirection::NorthWest => {
+            r.set_top(north);
+            r.set_left(west);
+        }
+        egui::ResizeDirection::NorthEast => {
+            r.set_top(north);
+            r.set_right(east);
+        }
+        egui::ResizeDirection::SouthWest => {
+            r.set_bottom(south);
+            r.set_left(west);
+        }
+        egui::ResizeDirection::SouthEast => {
+            r.set_bottom(south);
+            r.set_right(east);
+        }
+    }
+    r
 }
 
 fn resize_cursor(dir: egui::ResizeDirection) -> egui::CursorIcon {
