@@ -4,6 +4,8 @@ use thiserror::Error;
 #[cfg(windows)]
 pub mod win32;
 
+pub mod vlm;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Rect {
     pub x: f32,

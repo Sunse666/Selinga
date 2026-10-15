@@ -8,7 +8,7 @@
 - **拖框即译**：方框拖到哪译到哪；内容变化自动重新识别，静止内容走帧哈希 + LRU 双层缓存，零重复开销
 - **离线 OCR**：Windows.Media.Ocr 系统级识别（中文/英文/日文等，随系统语言包），不上传画面
 - **多后端翻译链**：腾讯 TranSmart（免 key 国内直连）→ Google → MyMemory，自动降级，失败不卡 UI
-- **VLM 增强（可选）**：接入任意 OpenAI 兼容端点（云端 API 或本地 Ollama）提升翻译质量
+- **AI 增强（可选）**：视觉大模型同时接管**识别与翻译**（任意 OpenAI 兼容端点：云端 API、硅基流动、本地 Ollama 均可），识别失败自动回退本地 OCR，译文链路照常多级降级
 - **双语对照 / 纯译文**两种显示模式，字号自适应，一键复制
 - **系统托盘 + 全局热键**：方框不在焦点也能控制
 - **设置持久化**：目标语言、显示模式、暂停状态存 TOML，重启保留
@@ -21,6 +21,7 @@
 | 隐藏 / 显示方框 | `Ctrl+Alt+H` | 隐藏方框 |
 | 暂停 / 恢复识别 | `Ctrl+Alt+P` | 暂停识别 |
 | 强制重新识别 | 方框工具栏 刷新图标 | 重新识别 |
+| 切换 AI 识别 | — | AI 识别：开/关 |
 | 重新框选区域 | — | 重新框选 |
 | 退出 | 方框上 `Alt+F4` | 退出 |
 
@@ -53,7 +54,7 @@ api_key = ""                              # 云端服务才需要；留空 = 无
 model = "qwen2.5:7b"
 ```
 
-保存后重启生效。VLM 在翻译链中排第二级（TranSmart → **VLM** → Google → MyMemory），后端失败自动降级，不影响可用性。
+保存后重启生效。`enabled = true` 时视觉大模型同时接管识别与翻译：截图送 VLM 转录（失败自动回退 Windows OCR），译文链路变为 TranSmart → **VLM** → Google → MyMemory。托盘"AI 识别"可在运行时随时开关（状态写回配置），不用重启。
 
 ## 命令行调试工具
 
@@ -61,6 +62,7 @@ model = "qwen2.5:7b"
 cargo run -p selinga-cli -- capture-ocr --region 100,200,800,400
 cargo run -p selinga-cli -- capture-ocr --region 100,200,800,400 --lang zh-CN --boxes
 cargo run -p selinga-cli -- capture-ocr --region 100,200,800,400 --translate --tl zh-CN
+cargo run -p selinga-cli -- capture-ocr --region 100,200,800,400 --engine vlm   # 读取 settings.toml [vlm]
 ```
 
 ## 平台支持
@@ -76,7 +78,7 @@ cargo run -p selinga-cli -- capture-ocr --region 100,200,800,400 --translate --t
 
 ```
 selinga-capture     GDI 区域截屏（物理像素，DPI 感知）
-selinga-ocr         Windows.Media.Ocr 封装 + 识别增强管线（反色/对比度/二值化/拆字重试/双通道）
+selinga-ocr         OCR 后端抽象：Windows.Media.Ocr 封装（反色/对比度/二值化/拆字重试/双通道增强）+ VLM 视觉转录
 selinga-translate   Translator trait + TranSmart/Google/MyMemory/VLM 后端 + LRU 缓存 + 降级链
 selinga-pipeline    OCR 行与译文的结构化配对
 selinga-platform    截屏自我排除（WDA_EXCLUDEFROMCAPTURE）+ 主屏尺寸查询

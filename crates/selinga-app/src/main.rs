@@ -272,6 +272,9 @@ impl SelingaApp {
         let app = {
             let mut app = app;
             app.load_select_background(ctx);
+            if let Some(tray) = &app.tray {
+                tray.set_ai_label(app.vlm.enabled);
+            }
             app
         };
         #[cfg(not(windows))]
@@ -995,6 +998,13 @@ impl SelingaApp {
         let tx = worker.tx.clone();
         let cache = Arc::clone(&self.cache);
         let translator = Arc::clone(&self.translator);
+        // VLM endpoint drives both the OCR engine choice and the translator
+        // chain (build_translator appends VlmTranslator when configured).
+        let vlm_endpoint = self.vlm.config().map(|c| selinga_ocr::vlm::VlmEndpoint {
+            base_url: c.base_url,
+            api_key: c.api_key,
+            model: c.model,
+        });
         let region = selinga_capture::Region {
             x: (rect.min.x * ppp).round() as i32,
             y: (rect.min.y * ppp).round() as i32,
@@ -1026,11 +1036,7 @@ impl SelingaApp {
                 );
             }
 
-            let ocr = match selinga_ocr::win32::WinOcr::new(None) {
-                Ok(o) => o,
-                Err(e) => return send(&tx, WorkerMsg::Failed(format!("ocr engine: {e}"))),
-            };
-            let lines = match ocr.recognize(&frame) {
+            let lines = match recognize_lines(&frame, vlm_endpoint.as_ref()) {
                 Ok(l) => l,
                 Err(e) => return send(&tx, WorkerMsg::Failed(format!("ocr: {e}"))),
             };
@@ -1101,6 +1107,13 @@ impl SelingaApp {
                     self.persist_settings();
                     if let Some(tray) = &self.tray {
                         tray.set_paused_label(self.paused);
+                    }
+                }
+                TrayCommand::ToggleAi => {
+                    self.vlm.enabled = !self.vlm.enabled;
+                    self.persist_settings();
+                    if let Some(tray) = &self.tray {
+                        tray.set_ai_label(self.vlm.enabled);
                     }
                 }
                 TrayCommand::Refresh => {
@@ -1197,6 +1210,53 @@ impl SelingaApp {
 #[cfg(windows)]
 fn send(tx: &std::sync::mpsc::Sender<WorkerMsg>, msg: WorkerMsg) {
     let _ = tx.send(msg);
+}
+
+/// Run recognition through the configured engine. VLM first when enabled,
+/// falling back to the local Windows engine on any failure so the overlay
+/// never goes blank.
+#[cfg(windows)]
+fn recognize_lines(
+    frame: &selinga_capture::Frame,
+    vlm: Option<&selinga_ocr::vlm::VlmEndpoint>,
+) -> Result<Vec<selinga_ocr::OcrLine>, String> {
+    if let Some(endpoint) = vlm {
+        match selinga_ocr::vlm::VlmOcr::new(endpoint.clone()).recognize(frame) {
+            Ok(lines) => return Ok(synthesize_layout(lines, frame)),
+            Err(e) => eprintln!("selinga: vlm ocr failed, falling back: {e}"),
+        }
+    }
+    let ocr = selinga_ocr::win32::WinOcr::new(None).map_err(|e| format!("ocr engine: {e}"))?;
+    ocr.recognize(frame).map_err(|e| format!("ocr: {e}"))
+}
+
+/// VLM replies carry no geometry; give those lines even rows spanning the
+/// crop so the overlay has something to anchor to.
+#[cfg(windows)]
+fn synthesize_layout(
+    lines: Vec<selinga_ocr::OcrLine>,
+    frame: &selinga_capture::Frame,
+) -> Vec<selinga_ocr::OcrLine> {
+    if lines.is_empty() || !lines.iter().any(|l| l.rect.is_none()) {
+        return lines;
+    }
+    let n = lines.len();
+    let row_h = frame.height as f32 / n as f32;
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut line)| {
+            if line.rect.is_none() {
+                line.rect = Some(selinga_ocr::Rect {
+                    x: 0.0,
+                    y: row_h * i as f32,
+                    w: frame.width as f32,
+                    h: row_h,
+                });
+            }
+            line
+        })
+        .collect()
 }
 
 #[cfg(windows)]

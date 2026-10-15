@@ -29,6 +29,10 @@ enum Cmd {
         translate: bool,
         #[arg(long)]
         tl: Option<String>,
+        /// OCR engine: "win" (Windows.Media.Ocr, default) or "vlm"
+        /// (OpenAI-compatible vision model, reads [vlm] from settings.toml).
+        #[arg(long = "engine", default_value = "win")]
+        engine: String,
     },
 }
 
@@ -43,6 +47,7 @@ fn main() {
             dump,
             translate,
             tl,
+            engine,
         } => {
             if let Err(err) = run_capture_ocr(
                 &region,
@@ -51,6 +56,7 @@ fn main() {
                 dump.as_deref(),
                 translate,
                 tl.as_deref(),
+                &engine,
             ) {
                 eprintln!("error: {err}");
                 std::process::exit(1);
@@ -67,7 +73,13 @@ fn run_capture_ocr(
     dump: Option<&str>,
     translate: bool,
     tl: Option<&str>,
+    engine: &str,
 ) -> Result<(), String> {
+    if engine != "win" && engine != "vlm" {
+        return Err(format!(
+            "unknown engine {engine:?} (expected \"win\" or \"vlm\")"
+        ));
+    }
     let region = parse_region(region)?;
 
     #[cfg(windows)]
@@ -80,8 +92,16 @@ fn run_capture_ocr(
             eprintln!("frame dumped to {path}");
         }
 
-        let engine = selinga_ocr::win32::WinOcr::new(lang).map_err(|e| e.to_string())?;
-        let lines = engine.recognize(&frame).map_err(|e| e.to_string())?;
+        let lines = if engine == "vlm" {
+            let endpoint = load_vlm_endpoint()?;
+            eprintln!("engine: vlm ({} @ {})", endpoint.model, endpoint.base_url);
+            selinga_ocr::vlm::VlmOcr::new(endpoint)
+                .recognize(&frame)
+                .map_err(|e| e.to_string())?
+        } else {
+            let engine = selinga_ocr::win32::WinOcr::new(lang).map_err(|e| e.to_string())?;
+            engine.recognize(&frame).map_err(|e| e.to_string())?
+        };
 
         if lines.is_empty() {
             println!("(no text recognized)");
@@ -128,11 +148,56 @@ fn run_capture_ocr(
 
     #[cfg(not(windows))]
     {
-        let _ = (lang, boxes, dump, translate, tl);
+        let _ = (lang, boxes, dump, translate, tl, engine);
         Err(format!(
             "capture-ocr is Windows-only in M0 (region {region:?})"
         ))
     }
+}
+
+/// Read [vlm] from the same settings.toml the app uses and build an
+/// endpoint. Requires enabled = true plus non-empty base_url and model.
+fn load_vlm_endpoint() -> Result<selinga_ocr::vlm::VlmEndpoint, String> {
+    #[derive(serde::Deserialize)]
+    struct VlmSection {
+        #[serde(default)]
+        enabled: bool,
+        #[serde(default)]
+        base_url: String,
+        #[serde(default)]
+        api_key: String,
+        #[serde(default)]
+        model: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct File {
+        #[serde(default)]
+        vlm: Option<VlmSection>,
+    }
+
+    #[cfg(windows)]
+    let base = std::env::var_os("APPDATA").map(std::path::PathBuf::from);
+    #[cfg(not(windows))]
+    let base = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"));
+    let path = base
+        .map(|b| b.join("selinga").join("settings.toml"))
+        .ok_or_else(|| "cannot locate settings directory".to_owned())?;
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let file: File =
+        toml::from_str(&text).map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+    let vlm = file.vlm.ok_or("no [vlm] section in settings.toml")?;
+    if !vlm.enabled {
+        return Err("vlm.enabled = false in settings.toml".to_owned());
+    }
+    if vlm.base_url.trim().is_empty() || vlm.model.trim().is_empty() {
+        return Err("vlm.base_url and vlm.model must be set in settings.toml".to_owned());
+    }
+    Ok(selinga_ocr::vlm::VlmEndpoint {
+        base_url: vlm.base_url.trim().to_owned(),
+        api_key: Some(vlm.api_key.trim().to_owned()).filter(|k| !k.is_empty()),
+        model: vlm.model.trim().to_owned(),
+    })
 }
 
 #[cfg(windows)]

@@ -7,6 +7,7 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 pub enum TrayCommand {
     ToggleHidden,
     TogglePause,
+    ToggleAi,
     Refresh,
     Reselect,
     Quit,
@@ -17,6 +18,7 @@ pub struct Tray {
     _tray: TrayIcon,
     id_hide: tray_icon::menu::MenuId,
     id_pause: tray_icon::menu::MenuId,
+    id_ai: tray_icon::menu::MenuId,
     id_refresh: tray_icon::menu::MenuId,
     id_reselect: tray_icon::menu::MenuId,
     id_quit: tray_icon::menu::MenuId,
@@ -24,12 +26,14 @@ pub struct Tray {
     hk_pause: u32,
     item_hide: MenuItem,
     item_pause: MenuItem,
+    item_ai: MenuItem,
 }
 
 impl Tray {
     pub fn new() -> Result<Self, String> {
         let item_hide = MenuItem::with_id("hide", "隐藏方框  Ctrl+Alt+H", true, None);
         let item_pause = MenuItem::with_id("pause", "暂停识别  Ctrl+Alt+P", true, None);
+        let item_ai = MenuItem::with_id("ai", "AI 识别：关", true, None);
         let item_refresh = MenuItem::with_id("refresh", "重新识别", true, None);
         let item_reselect = MenuItem::with_id("reselect", "重新框选", true, None);
         let item_quit = MenuItem::with_id("quit", "退出", true, None);
@@ -37,6 +41,7 @@ impl Tray {
         menu.append_items(&[
             &item_hide,
             &item_pause,
+            &item_ai,
             &item_refresh,
             &item_reselect,
             &item_quit,
@@ -63,11 +68,13 @@ impl Tray {
             hk_pause: hk_pause.id,
             id_hide: item_hide.id().clone(),
             id_pause: item_pause.id().clone(),
+            id_ai: item_ai.id().clone(),
             id_refresh: item_refresh.id().clone(),
             id_reselect: item_reselect.id().clone(),
             id_quit: item_quit.id().clone(),
             item_hide,
             item_pause,
+            item_ai,
             _manager: manager,
             _tray: tray,
         })
@@ -80,6 +87,8 @@ impl Tray {
                 TrayCommand::ToggleHidden
             } else if event.id == self.id_pause {
                 TrayCommand::TogglePause
+            } else if event.id == self.id_ai {
+                TrayCommand::ToggleAi
             } else if event.id == self.id_refresh {
                 TrayCommand::Refresh
             } else if event.id == self.id_reselect {
@@ -117,6 +126,14 @@ impl Tray {
             "恢复识别  Ctrl+Alt+P"
         } else {
             "暂停识别  Ctrl+Alt+P"
+        });
+    }
+
+    pub fn set_ai_label(&self, enabled: bool) {
+        self.item_ai.set_text(if enabled {
+            "AI 识别：开"
+        } else {
+            "AI 识别：关"
         });
     }
 }
