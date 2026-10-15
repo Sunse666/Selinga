@@ -37,6 +37,8 @@ eframe = { version = "0.34", default-features = false, features = [
     "x11",
 ] }
 ureq = { version = "2", features = ["json"] }
+base64 = "0.22"
+png = "0.17"
 futures = "0.3"
 thiserror = "2"
 windows = { version = "0.61", features = [
