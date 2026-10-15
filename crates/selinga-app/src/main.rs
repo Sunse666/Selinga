@@ -226,7 +226,7 @@ impl SelingaApp {
             "bilingual" => DisplayMode::Bilingual,
             _ => DisplayMode::Translation,
         };
-        let mut app = Self {
+        let app = Self {
             paused: saved.paused,
             busy: false,
             dragging: false,
@@ -266,10 +266,16 @@ impl SelingaApp {
             worker: Some(Worker { tx, rx }),
             t0: Instant::now(),
         };
+        // The startup background capture only exists on Windows; on other
+        // platforms neither the context nor mutability is needed.
         #[cfg(windows)]
-        {
+        let app = {
+            let mut app = app;
             app.load_select_background(ctx);
-        }
+            app
+        };
+        #[cfg(not(windows))]
+        let _ = ctx;
         app
     }
 
