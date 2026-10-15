@@ -2697,7 +2697,7 @@ checksum = "2ab42ca02749e120097e328d91d415325bdf43b1c72c4c8badf37375fe40a813"
 
 [[package]]
 name = "selinga-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "eframe",
  "global-hotkey",
@@ -2714,7 +2714,7 @@ dependencies = [
 
 [[package]]
 name = "selinga-capture"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror 2.0.21",
  "windows",
@@ -2722,7 +2722,7 @@ dependencies = [
 
 [[package]]
 name = "selinga-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "selinga-capture",
@@ -2733,7 +2733,7 @@ dependencies = [
 
 [[package]]
 name = "selinga-ocr"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "selinga-capture",
  "thiserror 2.0.21",
@@ -2742,14 +2742,14 @@ dependencies = [
 
 [[package]]
 name = "selinga-overlay-ui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "selinga-pipeline",
 ]
 
 [[package]]
 name = "selinga-pipeline"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "selinga-capture",
  "selinga-ocr",
@@ -2758,14 +2758,14 @@ dependencies = [
 
 [[package]]
 name = "selinga-platform"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "windows",
 ]
 
 [[package]]
 name = "selinga-translate"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "thiserror 2.0.21",
