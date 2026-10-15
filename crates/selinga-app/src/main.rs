@@ -1,3 +1,6 @@
+// GUI 程序：release 下不挂控制台窗口；debug 保留以便看日志输出
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use eframe::egui;
 #[cfg(windows)]
 use selinga_capture::ScreenCapture;
@@ -29,6 +32,10 @@ const SOURCE_COLOR: egui::Color32 = egui::Color32::from_rgb(0x9A, 0x9A, 0xA8);
 const LINE_PAD: f32 = 3.0;
 const BILINGUAL_EXTRA: f32 = 0.62;
 const TARGET_LANGS: [&str; 4] = ["zh-CN", "en-US", "ja-JP", "ko-KR"];
+/// 框选面积小于该值视为误触，回退默认大小
+const MIN_SELECT: f32 = 80.0;
+/// 框选取消/误触时的默认方框尺寸
+const DEFAULT_SIZE: [f32; 2] = [380.0, 240.0];
 
 fn build_translator(
     target: &str,
@@ -56,6 +63,16 @@ fn build_translator(
 
 type ToolbarAction = Box<dyn Fn(&mut SelingaApp, &egui::Ui)>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolbarIcon {
+    Mode,
+    Copy,
+    Lang,
+    Refresh,
+    Pause,
+    Resume,
+}
+
 #[cfg(windows)]
 #[derive(Debug, Clone)]
 struct FrameCache {
@@ -79,6 +96,8 @@ impl DisplayMode {
 }
 
 fn main() -> eframe::Result<()> {
+    // 无边框窗口直接按主屏尺寸创建，铺满屏幕供框选，不做运行时全屏切换
+    let (screen_w, screen_h) = selinga_platform::primary_screen_points();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Selinga")
@@ -86,7 +105,9 @@ fn main() -> eframe::Result<()> {
             .with_transparent(true)
             .with_resizable(true)
             .with_active(true)
-            .with_inner_size([380.0, 240.0])
+            .with_visible(false)
+            .with_inner_size([screen_w, screen_h])
+            .with_position([0.0, 0.0])
             .with_window_level(egui::WindowLevel::AlwaysOnTop),
         ..Default::default()
     };
@@ -131,6 +152,13 @@ fn install_cjk_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// 应用阶段：Select=全屏冻结窗框选；Box=方框视口稳态（root 永久隐藏）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Select,
+    Box,
+}
+
 struct SelingaApp {
     paused: bool,
     busy: bool,
@@ -148,6 +176,20 @@ struct SelingaApp {
     translator: Arc<std::sync::RwLock<Arc<dyn Translator>>>,
     vlm: settings::VlmSettings,
     hidden: bool,
+    /// 双视口阶段：root 全屏冻结窗 → 框选完成后以选区几何 spawn BOX 视口，root 永久隐藏
+    phase: Phase,
+    /// 框选得到的方框几何（逻辑点，屏幕坐标）
+    sel_rect: Option<egui::Rect>,
+    marquee: Option<(egui::Pos2, egui::Pos2)>,
+    /// root 视口隐藏待显示（启动时）
+    show_pending: bool,
+    pending_frames: u32,
+    /// BOX 视口隐藏待显示（创建后画 2 帧再显示，随后才隐藏 root —— Snipaste 交接顺序）
+    box_show_pending: bool,
+    box_pending_frames: u32,
+    /// 框选背景：启动时冻结的全屏截图（GL 表面不支持透明时的可靠方案）
+    #[cfg(windows)]
+    select_bg: Option<egui::TextureHandle>,
     #[cfg(windows)]
     tray: Option<Tray>,
     #[cfg(windows)]
@@ -199,6 +241,15 @@ impl SelingaApp {
             translate_error: None,
             target_lang,
             hidden: false,
+            phase: Phase::Select,
+            sel_rect: None,
+            marquee: None,
+            show_pending: true,
+            pending_frames: 0,
+            box_show_pending: false,
+            box_pending_frames: 0,
+            #[cfg(windows)]
+            select_bg: None,
             vlm: saved.vlm.clone(),
             translator: Arc::new(std::sync::RwLock::new(build_translator(
                 TARGET_LANGS[target_lang],
@@ -228,55 +279,258 @@ impl SelingaApp {
 }
 
 impl eframe::App for SelingaApp {
+    // eframe 默认清屏色自带 70% 暗灰（12,12,12,180），叠上框选遮罩后屏幕几乎不可见；
+    // Select 阶段改为全透明（遮罩自带薄纱），Box 阶段方框窗口保持默认暗底
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if self.phase == Phase::Select {
+            egui::Color32::TRANSPARENT.to_normalized_gamma_f32()
+        } else {
+            egui::Color32::from_rgba_unmultiplied(12, 12, 12, 180).to_normalized_gamma_f32()
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
-        if self.last_exclude.elapsed() > EXCLUDE_INTERVAL {
-            self.last_exclude = Instant::now();
-            selinga_platform::exclude_self_from_capture();
+        match self.phase {
+            Phase::Select => {
+                #[cfg(windows)]
+                if self.select_bg.is_none() {
+                    self.load_select_background(&ctx);
+                }
+                self.draw_select_overlay(ui, &ctx);
+                self.handle_pending_show(&ctx);
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+            Phase::Box => {
+                // root 已隐藏，唯一职责是每帧驱动 BOX 视口
+                self.draw_box_viewport(&ctx);
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
         }
-
-        let outer = ctx.input(|i| i.viewport().outer_rect);
-        let ppp = ctx.native_pixels_per_point().unwrap_or(1.0);
-
-        if outer != self.last_rect {
-            self.last_rect = outer;
-            self.stable_since = Some(Instant::now());
-        }
-        let stable_for = self
-            .stable_since
-            .map(|t| t.elapsed())
-            .unwrap_or(Duration::ZERO);
-
-        self.drain_worker(&ctx);
-        self.drain_tray(&ctx);
-        self.draw_box(ui, &ctx);
-
-        let pointer_idle = !ctx.input(|i| i.pointer.any_down());
-        let debounce_due = self.stable_since.is_some() && stable_for >= DEBOUNCE;
-        let poll_due = self.stable_since.is_none()
-            && self
-                .last_trigger
-                .is_some_and(|t| t.elapsed() >= POLL_INTERVAL);
-        if (debounce_due || poll_due)
-            && pointer_idle
-            && !self.paused
-            && !self.hidden
-            && !self.busy
-            && !self.dragging
-            && self.resizing.is_none()
-            && let Some(rect) = outer
-        {
-            self.trigger(&ctx, rect, ppp, false);
-        }
-
-        self.draw_overlay_results(ui, ppp);
-
-        ctx.request_repaint_after(Duration::from_millis(100));
     }
 }
 
 impl SelingaApp {
+    /// BOX 视口：以选区几何创建（创建即最终尺寸，不走 resize），先隐藏画 2 帧，
+    /// 显示之后才隐藏 root —— 与 Snipaste 相同的交接顺序，全程屏幕有内容
+    fn draw_box_viewport(&mut self, root_ctx: &egui::Context) {
+        let Some(sel) = self.sel_rect else {
+            return;
+        };
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Selinga Box")
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_resizable(true)
+            .with_active(true)
+            .with_visible(false)
+            .with_position(sel.min)
+            .with_inner_size(sel.size())
+            .with_window_level(egui::WindowLevel::AlwaysOnTop);
+        // Context 内部是同一个 Arc；在 BOX 回调内操作 root 必须显式指定视口 id
+        let root_ctx = root_ctx.clone();
+        root_ctx.show_viewport_immediate(
+            egui::ViewportId(egui::Id::new("selinga_box")),
+            builder,
+            |ui, _class| {
+                let box_ctx = ui.ctx().clone();
+
+                // 隐藏期间画 2 帧内容后再显示；显示完成后才收走 root（无缝交接）
+                if self.box_show_pending {
+                    self.box_pending_frames += 1;
+                    if self.box_pending_frames >= 2 {
+                        self.box_show_pending = false;
+                        box_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        // root 移出屏幕并缩到 1x1，释放显存。
+                        // 注意：不能 Visible(false) —— eframe 对隐藏视口不调用 App::ui
+                        // （epi_integration.rs: if is_visible），immediate 子视口会被冻结。
+                        // 冻结截图与真实屏幕内容一致，root 移出瞬间视觉无缝。
+                        root_ctx.send_viewport_cmd_to(
+                            egui::ViewportId::ROOT,
+                            egui::ViewportCommand::OuterPosition(egui::pos2(-16000.0, -16000.0)),
+                        );
+                        root_ctx.send_viewport_cmd_to(
+                            egui::ViewportId::ROOT,
+                            egui::ViewportCommand::InnerSize(egui::vec2(1.0, 1.0)),
+                        );
+                    }
+                }
+
+                if self.last_exclude.elapsed() > EXCLUDE_INTERVAL {
+                    self.last_exclude = Instant::now();
+                    selinga_platform::exclude_self_from_capture();
+                }
+
+                let outer = box_ctx.input(|i| i.viewport().outer_rect);
+                let ppp = box_ctx.native_pixels_per_point().unwrap_or(1.0);
+
+                if outer != self.last_rect {
+                    self.last_rect = outer;
+                    self.stable_since = Some(Instant::now());
+                }
+                let stable_for = self
+                    .stable_since
+                    .map(|t| t.elapsed())
+                    .unwrap_or(Duration::ZERO);
+
+                self.drain_worker(&box_ctx);
+                self.drain_tray(&box_ctx);
+                self.draw_box(ui, &box_ctx);
+
+                let pointer_idle = !box_ctx.input(|i| i.pointer.any_down());
+                let debounce_due = self.stable_since.is_some() && stable_for >= DEBOUNCE;
+                let poll_due = self.stable_since.is_none()
+                    && self
+                        .last_trigger
+                        .is_some_and(|t| t.elapsed() >= POLL_INTERVAL);
+                if (debounce_due || poll_due)
+                    && pointer_idle
+                    && !self.paused
+                    && !self.hidden
+                    && !self.busy
+                    && !self.dragging
+                    && self.resizing.is_none()
+                    && let Some(rect) = outer
+                {
+                    self.trigger(&box_ctx, rect, ppp, false);
+                }
+
+                self.draw_overlay_results(ui, ppp);
+            },
+        );
+    }
+
+    /// 延迟显示：等几何调整生效且至少画过一帧内容后再显示窗口（命令在 present 后应用，
+    /// 首个可见帧即完整内容），消除表面创建/重建时的黑屏闪帧
+    fn handle_pending_show(&mut self, ctx: &egui::Context) {
+        if !self.show_pending {
+            return;
+        }
+        self.pending_frames += 1;
+        if self.pending_frames >= 2 {
+            self.show_pending = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+    }
+
+    /// 全屏抓一张作为框选背景。GL 表面不支持透明时（纯黑遮罩的根因），
+    /// 用"冻结屏幕 + 半透明暗纱"达到同样的视觉蒙版效果，且不依赖驱动。
+    #[cfg(windows)]
+    fn load_select_background(&mut self, ctx: &egui::Context) {
+        let (w, h) = selinga_platform::primary_screen_px();
+        let capture = match selinga_capture::win32::GdiCapture::new() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let Ok(frame) = capture.capture_region(selinga_capture::Region { x: 0, y: 0, w, h }) else {
+            return;
+        };
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [frame.width as usize, frame.height as usize],
+            &frame.to_rgba(),
+        );
+        self.select_bg = Some(ctx.load_texture("select_bg", image, egui::TextureOptions::LINEAR));
+    }
+
+    fn draw_select_overlay(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let rect = ui.max_rect();
+        let painter = ui.painter().clone();
+
+        #[cfg(windows)]
+        if let Some(tex) = &self.select_bg {
+            painter.image(
+                tex.id(),
+                rect,
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+        painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(70));
+
+        let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+        let pointer = ctx.input(|i| i.pointer.clone());
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) || resp.secondary_clicked() {
+            self.finish_select(ctx, None);
+            return;
+        }
+
+        if pointer.any_down() {
+            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+
+        if pointer.primary_pressed() {
+            self.marquee = pointer.interact_pos().map(|p| (p, p));
+        } else if pointer.primary_down()
+            && let (Some((_, cur)), Some(p)) = (&mut self.marquee, pointer.interact_pos())
+        {
+            *cur = p;
+        }
+
+        if let Some((a, b)) = self.marquee {
+            let sel = egui::Rect::from_two_pos(a, b);
+            painter.rect_filled(
+                sel,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(0x53, 0x4A, 0xB7, 45),
+            );
+            painter.rect_stroke(
+                sel,
+                0.0,
+                egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0x8A, 0x81, 0xE8)),
+                egui::StrokeKind::Inside,
+            );
+            let label = format!("{:.0} x {:.0}", sel.width(), sel.height());
+            let label_pos = egui::pos2(
+                sel.left().clamp(rect.left() + 40.0, rect.right() - 40.0),
+                (sel.top() - 12.0).max(rect.top() + 10.0),
+            );
+            painter.text(
+                label_pos,
+                egui::Align2::CENTER_BOTTOM,
+                label,
+                egui::FontId::proportional(13.0),
+                TEXT_COLOR,
+            );
+        }
+
+        if pointer.primary_released()
+            && let Some((a, b)) = self.marquee.take()
+        {
+            self.finish_select(ctx, Some(egui::Rect::from_two_pos(a, b)));
+        }
+    }
+
+    /// 结束框选：记录选区几何并切换到 Box 阶段（下一帧 spawn BOX 视口，创建即最终尺寸）；
+    /// `None` 或面积过小则取默认 380x240（屏幕居中）。root 全屏窗在 BOX 显示后才隐藏。
+    fn finish_select(&mut self, _ctx: &egui::Context, sel: Option<egui::Rect>) {
+        self.marquee = None;
+        let valid = sel.is_some_and(|r| r.width() >= MIN_SELECT && r.height() >= MIN_SELECT);
+        self.sel_rect = Some(if valid {
+            sel.unwrap_or(egui::Rect::ZERO)
+        } else {
+            let (sw, sh) = selinga_platform::primary_screen_points();
+            egui::Rect::from_min_size(
+                egui::pos2((sw - DEFAULT_SIZE[0]) * 0.5, (sh - DEFAULT_SIZE[1]) * 0.5),
+                egui::Vec2::from(DEFAULT_SIZE),
+            )
+        });
+        self.phase = Phase::Box;
+        self.box_show_pending = true;
+        self.box_pending_frames = 0;
+        self.last_rect = None;
+        self.stable_since = None;
+        self.last_trigger = None;
+        self.result = None;
+        self.translate_error = None;
+        self.busy = false;
+        #[cfg(windows)]
+        {
+            self.select_bg = None;
+        }
+    }
+
     fn draw_box(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let rect = ui.max_rect();
         ui.painter().rect_stroke(
@@ -329,16 +583,23 @@ impl SelingaApp {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn draw_toolbar(&mut self, ui: &mut egui::Ui, box_rect: egui::Rect) -> bool {
-        let mode_label = match self.display_mode {
-            DisplayMode::Translation => "mode: translation".to_owned(),
-            DisplayMode::Bilingual => "mode: bilingual".to_owned(),
+        use ToolbarIcon::{Copy, Lang, Mode, Pause, Refresh, Resume};
+
+        let lang_code = TARGET_LANGS[self.target_lang]
+            .split('-')
+            .next()
+            .unwrap_or("EN")
+            .to_uppercase();
+        let mode_tip = match self.display_mode {
+            DisplayMode::Translation => "switch to bilingual",
+            DisplayMode::Bilingual => "switch to translation only",
         };
-        let lang = TARGET_LANGS[self.target_lang];
-        let buttons: Vec<(f32, String, ToolbarAction)> = vec![
+        let buttons: Vec<(ToolbarIcon, &str, ToolbarAction)> = vec![
             (
-                118.0,
-                mode_label,
+                Mode,
+                mode_tip,
                 Box::new(|app: &mut Self, ui: &egui::Ui| {
                     app.display_mode = app.display_mode.toggle();
                     app.persist_settings();
@@ -346,8 +607,8 @@ impl SelingaApp {
                 }),
             ),
             (
-                46.0,
-                "copy".to_owned(),
+                Copy,
+                "copy result",
                 Box::new(|app: &mut Self, ui: &egui::Ui| {
                     if let Some(Ok(output)) = &app.result {
                         let text = match app.display_mode {
@@ -360,8 +621,8 @@ impl SelingaApp {
                 }),
             ),
             (
-                56.0,
-                format!("to: {}", lang.split('-').next().unwrap_or(lang)),
+                Lang,
+                "target language",
                 Box::new(|app: &mut Self, _ui: &egui::Ui| {
                     app.target_lang = (app.target_lang + 1) % TARGET_LANGS.len();
                     let target = TARGET_LANGS[app.target_lang];
@@ -372,8 +633,8 @@ impl SelingaApp {
                 }),
             ),
             (
-                58.0,
-                "refresh".to_owned(),
+                Refresh,
+                "re-recognize",
                 Box::new(|app: &mut Self, ui: &egui::Ui| {
                     if !app.busy {
                         let ppp = ui.ctx().native_pixels_per_point().unwrap_or(1.0);
@@ -382,36 +643,137 @@ impl SelingaApp {
                 }),
             ),
             (
-                62.0,
-                if self.paused { "resume" } else { "pause" }.to_owned(),
+                if self.paused { Resume } else { Pause },
+                if self.paused { "resume" } else { "pause" },
                 Box::new(|app: &mut Self, _ui: &egui::Ui| {
                     app.paused = !app.paused;
                     app.persist_settings();
                 }),
             ),
         ];
-        let mut x = box_rect.right() - 6.0;
+
+        const ICON: f32 = 22.0;
+        const GAP: f32 = 2.0;
+        let n = buttons.len() as f32;
+        let total_h = n * ICON + (n - 1.0) * GAP;
+        let y0 = if total_h + 8.0 >= box_rect.height() {
+            box_rect.top() + 4.0
+        } else {
+            box_rect.center().y - total_h * 0.5
+        };
+        let x_right = box_rect.right() - 4.0;
+        let column_rect = egui::Rect::from_min_size(
+            egui::pos2(x_right - ICON - 5.0, y0 - 5.0),
+            egui::vec2(ICON + 10.0, total_h + 10.0),
+        );
+        let painter = ui.painter().clone();
+        painter.rect_filled(column_rect, 8.0, egui::Color32::from_black_alpha(110));
+
+        let pointer_pos = ui.input(|i| i.pointer.latest_pos());
         let mut any_hovered = false;
-        for (w, label, action) in buttons.iter().rev() {
-            x -= w;
+        for (idx, (icon, tip, action)) in buttons.iter().enumerate() {
             let btn_rect = egui::Rect::from_min_size(
-                egui::pos2(x, box_rect.top() + 6.0),
-                egui::vec2(*w, 20.0),
+                egui::pos2(x_right - ICON, y0 + idx as f32 * (ICON + GAP)),
+                egui::vec2(ICON, ICON),
             );
-            any_hovered |= ui
-                .input(|i| i.pointer.latest_pos())
-                .is_some_and(|p| btn_rect.contains(p));
-            let resp = ui.put(btn_rect, egui::Button::new(label.clone()).small());
+            let hovered = pointer_pos.is_some_and(|p| btn_rect.contains(p));
+            any_hovered |= hovered;
+            let color = if hovered {
+                TEXT_COLOR
+            } else {
+                TEXT_COLOR.gamma_multiply(0.72)
+            };
+            if hovered {
+                painter.rect_filled(btn_rect, 6.0, egui::Color32::from_white_alpha(26));
+            }
+            let resp = ui.allocate_rect(btn_rect, egui::Sense::click());
             if resp.clicked() {
                 action(self, ui);
+            }
+            if resp.hovered() {
+                resp.on_hover_text(*tip);
+            }
+            let stroke = egui::Stroke::new(1.6_f32, color);
+            match icon {
+                ToolbarIcon::Mode => {
+                    let (l, r, cy) = (
+                        btn_rect.left() + 3.0,
+                        btn_rect.right() - 3.0,
+                        btn_rect.center().y,
+                    );
+                    painter.arrow(egui::pos2(l, cy - 3.5), egui::vec2(r - l, 0.0), stroke);
+                    painter.arrow(egui::pos2(r, cy + 3.5), egui::vec2(l - r, 0.0), stroke);
+                }
+                ToolbarIcon::Copy => {
+                    let back = egui::Rect::from_min_size(
+                        egui::pos2(btn_rect.left() + 4.0, btn_rect.top() + 3.0),
+                        egui::vec2(9.0, 9.0),
+                    );
+                    let front = egui::Rect::from_min_size(
+                        egui::pos2(btn_rect.left() + 8.0, btn_rect.top() + 9.0),
+                        egui::vec2(9.0, 9.0),
+                    );
+                    painter.rect_stroke(back, 2.0, stroke, egui::StrokeKind::Inside);
+                    painter.rect_filled(front, 2.0, egui::Color32::from_rgb(0x22, 0x22, 0x2A));
+                    painter.rect_stroke(front, 2.0, stroke, egui::StrokeKind::Inside);
+                }
+                ToolbarIcon::Lang => {
+                    painter.text(
+                        btn_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        lang_code.as_str(),
+                        egui::FontId::proportional(9.5),
+                        color,
+                    );
+                }
+                ToolbarIcon::Refresh => {
+                    let c = btn_rect.center();
+                    painter.circle_stroke(c, 5.5, stroke);
+                    let a = 45_f32.to_radians();
+                    let (dx, dy) = (a.cos(), a.sin());
+                    let edge = egui::pos2(c.x + 5.5 * dx, c.y + 5.5 * dy);
+                    let tip = egui::pos2(edge.x - 3.0 * dy, edge.y + 3.0 * dx);
+                    let base = egui::pos2(edge.x + 3.0 * dy, edge.y - 3.0 * dx);
+                    let inner = egui::pos2(c.x + 1.5 * dx, c.y + 1.5 * dy);
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![tip, base, inner],
+                        color,
+                        egui::Stroke::NONE,
+                    ));
+                }
+                ToolbarIcon::Pause => {
+                    let c = btn_rect.center();
+                    for x_off in [-4.5_f32, 1.5] {
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(c.x + x_off, c.y - 4.5),
+                                egui::vec2(3.0, 9.0),
+                            ),
+                            1.0,
+                            color,
+                        );
+                    }
+                }
+                ToolbarIcon::Resume => {
+                    let c = btn_rect.center();
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![
+                            egui::pos2(c.x - 3.5, c.y - 5.0),
+                            egui::pos2(c.x - 3.5, c.y + 5.0),
+                            egui::pos2(c.x + 5.0, c.y),
+                        ],
+                        color,
+                        egui::Stroke::NONE,
+                    ));
+                }
             }
         }
         if self
             .copied_at
             .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
         {
-            ui.painter().text(
-                egui::pos2(x - 8.0, box_rect.top() + 16.0),
+            painter.text(
+                egui::pos2(column_rect.left() - 6.0, column_rect.center().y),
                 egui::Align2::RIGHT_CENTER,
                 "copied!",
                 egui::FontId::proportional(12.0),
