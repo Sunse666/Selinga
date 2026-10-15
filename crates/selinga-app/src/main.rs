@@ -365,7 +365,10 @@ impl SelingaApp {
                     self.last_exclude = Instant::now();
                 }
                 if f == BOX_SHOW_AT_FRAME {
-                    eprintln!("selinga: t={}ms box revealed", self.t0.elapsed().as_millis());
+                    eprintln!(
+                        "selinga: t={}ms box revealed",
+                        self.t0.elapsed().as_millis()
+                    );
                     box_ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(sel.min));
                     box_ctx.request_repaint();
                 }
