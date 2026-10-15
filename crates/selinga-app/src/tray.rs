@@ -8,6 +8,7 @@ pub enum TrayCommand {
     ToggleHidden,
     TogglePause,
     Refresh,
+    Reselect,
     Quit,
 }
 
@@ -17,6 +18,7 @@ pub struct Tray {
     id_hide: tray_icon::menu::MenuId,
     id_pause: tray_icon::menu::MenuId,
     id_refresh: tray_icon::menu::MenuId,
+    id_reselect: tray_icon::menu::MenuId,
     id_quit: tray_icon::menu::MenuId,
     hk_hide: u32,
     hk_pause: u32,
@@ -29,10 +31,17 @@ impl Tray {
         let item_hide = MenuItem::with_id("hide", "隐藏方框  Ctrl+Alt+H", true, None);
         let item_pause = MenuItem::with_id("pause", "暂停识别  Ctrl+Alt+P", true, None);
         let item_refresh = MenuItem::with_id("refresh", "重新识别", true, None);
+        let item_reselect = MenuItem::with_id("reselect", "重新框选", true, None);
         let item_quit = MenuItem::with_id("quit", "退出", true, None);
         let menu = Menu::new();
-        menu.append_items(&[&item_hide, &item_pause, &item_refresh, &item_quit])
-            .map_err(|e| e.to_string())?;
+        menu.append_items(&[
+            &item_hide,
+            &item_pause,
+            &item_refresh,
+            &item_reselect,
+            &item_quit,
+        ])
+        .map_err(|e| e.to_string())?;
 
         let icon = tray_icon::Icon::from_rgba(icon_rgba(32), 32, 32).map_err(|e| e.to_string())?;
         let tray = TrayIconBuilder::new()
@@ -55,6 +64,7 @@ impl Tray {
             id_hide: item_hide.id().clone(),
             id_pause: item_pause.id().clone(),
             id_refresh: item_refresh.id().clone(),
+            id_reselect: item_reselect.id().clone(),
             id_quit: item_quit.id().clone(),
             item_hide,
             item_pause,
@@ -72,6 +82,8 @@ impl Tray {
                 TrayCommand::TogglePause
             } else if event.id == self.id_refresh {
                 TrayCommand::Refresh
+            } else if event.id == self.id_reselect {
+                TrayCommand::Reselect
             } else if event.id == self.id_quit {
                 TrayCommand::Quit
             } else {

@@ -12,3 +12,7 @@
 Thumbs.db
 DEVELOPMENT.md
 docs/
+
+# Local working notes (commit message drafts etc.)
+.workbuddy/
+.workbuddy-test/

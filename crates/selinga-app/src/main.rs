@@ -1,4 +1,3 @@
-// GUI 程序：release 下不挂控制台窗口；debug 保留以便看日志输出
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use eframe::egui;
@@ -32,10 +31,10 @@ const SOURCE_COLOR: egui::Color32 = egui::Color32::from_rgb(0x9A, 0x9A, 0xA8);
 const LINE_PAD: f32 = 3.0;
 const BILINGUAL_EXTRA: f32 = 0.62;
 const TARGET_LANGS: [&str; 4] = ["zh-CN", "en-US", "ja-JP", "ko-KR"];
-/// 框选面积小于该值视为误触，回退默认大小
 const MIN_SELECT: f32 = 80.0;
-/// 框选取消/误触时的默认方框尺寸
 const DEFAULT_SIZE: [f32; 2] = [380.0, 240.0];
+const BOX_SHOW_AT_FRAME: u32 = 3;
+const BOX_HANDOFF_AT_FRAME: u32 = 8;
 
 fn build_translator(
     target: &str,
@@ -96,7 +95,6 @@ impl DisplayMode {
 }
 
 fn main() -> eframe::Result<()> {
-    // 无边框窗口直接按主屏尺寸创建，铺满屏幕供框选，不做运行时全屏切换
     let (screen_w, screen_h) = selinga_platform::primary_screen_points();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -105,9 +103,9 @@ fn main() -> eframe::Result<()> {
             .with_transparent(true)
             .with_resizable(true)
             .with_active(true)
-            .with_visible(false)
+            .with_visible(true)
             .with_inner_size([screen_w, screen_h])
-            .with_position([0.0, 0.0])
+            .with_position([-16000.0, -16000.0])
             .with_window_level(egui::WindowLevel::AlwaysOnTop),
         ..Default::default()
     };
@@ -117,7 +115,7 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| {
             selinga_platform::exclude_self_from_capture();
             install_cjk_fonts(&cc.egui_ctx);
-            Ok(Box::new(SelingaApp::new()))
+            Ok(Box::new(SelingaApp::new(&cc.egui_ctx)))
         }),
     )
 }
@@ -152,11 +150,14 @@ fn install_cjk_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// 应用阶段：Select=全屏冻结窗框选；Box=方框视口稳态（root 永久隐藏）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Select,
     Box,
+}
+
+fn box_viewport_id() -> egui::ViewportId {
+    egui::ViewportId(egui::Id::new("selinga_box"))
 }
 
 struct SelingaApp {
@@ -176,20 +177,19 @@ struct SelingaApp {
     translator: Arc<std::sync::RwLock<Arc<dyn Translator>>>,
     vlm: settings::VlmSettings,
     hidden: bool,
-    /// 双视口阶段：root 全屏冻结窗 → 框选完成后以选区几何 spawn BOX 视口，root 永久隐藏
     phase: Phase,
-    /// 框选得到的方框几何（逻辑点，屏幕坐标）
     sel_rect: Option<egui::Rect>,
     marquee: Option<(egui::Pos2, egui::Pos2)>,
-    /// root 视口隐藏待显示（启动时）
     show_pending: bool,
     pending_frames: u32,
-    /// BOX 视口隐藏待显示（创建后画 2 帧再显示，随后才隐藏 root —— Snipaste 交接顺序）
+    show_after_frames: u32,
     box_show_pending: bool,
     box_pending_frames: u32,
-    /// 框选背景：启动时冻结的全屏截图（GL 表面不支持透明时的可靠方案）
+    #[cfg(windows)]
+    live_bg: Option<egui::TextureHandle>,
     #[cfg(windows)]
     select_bg: Option<egui::TextureHandle>,
+    t0: Instant,
     #[cfg(windows)]
     tray: Option<Tray>,
     #[cfg(windows)]
@@ -214,7 +214,7 @@ enum WorkerMsg {
 }
 
 impl SelingaApp {
-    fn new() -> Self {
+    fn new(ctx: &egui::Context) -> Self {
         #[cfg(windows)]
         let (tx, rx) = std::sync::mpsc::channel();
         let saved = Settings::load();
@@ -226,7 +226,7 @@ impl SelingaApp {
             "bilingual" => DisplayMode::Bilingual,
             _ => DisplayMode::Translation,
         };
-        Self {
+        let mut app = Self {
             paused: saved.paused,
             busy: false,
             dragging: false,
@@ -246,8 +246,11 @@ impl SelingaApp {
             marquee: None,
             show_pending: true,
             pending_frames: 0,
+            show_after_frames: 1,
             box_show_pending: false,
             box_pending_frames: 0,
+            #[cfg(windows)]
+            live_bg: None,
             #[cfg(windows)]
             select_bg: None,
             vlm: saved.vlm.clone(),
@@ -261,7 +264,13 @@ impl SelingaApp {
             cache: Arc::new(Mutex::new(None)),
             #[cfg(windows)]
             worker: Some(Worker { tx, rx }),
+            t0: Instant::now(),
+        };
+        #[cfg(windows)]
+        {
+            app.load_select_background(ctx);
         }
+        app
     }
 
     fn persist_settings(&self) {
@@ -279,8 +288,6 @@ impl SelingaApp {
 }
 
 impl eframe::App for SelingaApp {
-    // eframe 默认清屏色自带 70% 暗灰（12,12,12,180），叠上框选遮罩后屏幕几乎不可见；
-    // Select 阶段改为全透明（遮罩自带薄纱），Box 阶段方框窗口保持默认暗底
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         if self.phase == Phase::Select {
             egui::Color32::TRANSPARENT.to_normalized_gamma_f32()
@@ -299,21 +306,32 @@ impl eframe::App for SelingaApp {
                     self.load_select_background(&ctx);
                 }
                 self.draw_select_overlay(ui, &ctx);
+                #[cfg(windows)]
+                self.drain_tray_quit_only();
                 self.handle_pending_show(&ctx);
-                ctx.request_repaint_after(Duration::from_millis(50));
+                if self.show_pending {
+                    ctx.request_repaint();
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(50));
+                }
             }
             Phase::Box => {
-                // root 已隐藏，唯一职责是每帧驱动 BOX 视口
+                #[cfg(windows)]
+                if self.box_show_pending {
+                    self.draw_frozen_background(ui);
+                }
                 self.draw_box_viewport(&ctx);
-                ctx.request_repaint_after(Duration::from_millis(100));
+                if self.box_show_pending {
+                    ctx.request_repaint();
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                }
             }
         }
     }
 }
 
 impl SelingaApp {
-    /// BOX 视口：以选区几何创建（创建即最终尺寸，不走 resize），先隐藏画 2 帧，
-    /// 显示之后才隐藏 root —— 与 Snipaste 相同的交接顺序，全程屏幕有内容
     fn draw_box_viewport(&mut self, root_ctx: &egui::Context) {
         let Some(sel) = self.sel_rect else {
             return;
@@ -324,108 +342,124 @@ impl SelingaApp {
             .with_transparent(true)
             .with_resizable(true)
             .with_active(true)
-            .with_visible(false)
-            .with_position(sel.min)
+            .with_visible(true)
+            .with_position([-16000.0, -16000.0])
             .with_inner_size(sel.size())
             .with_window_level(egui::WindowLevel::AlwaysOnTop);
-        // Context 内部是同一个 Arc；在 BOX 回调内操作 root 必须显式指定视口 id
         let root_ctx = root_ctx.clone();
-        root_ctx.show_viewport_immediate(
-            egui::ViewportId(egui::Id::new("selinga_box")),
-            builder,
-            |ui, _class| {
-                let box_ctx = ui.ctx().clone();
+        root_ctx.show_viewport_immediate(box_viewport_id(), builder, |ui, _class| {
+            let box_ctx = ui.ctx().clone();
 
-                // 隐藏期间画 2 帧内容后再显示；显示完成后才收走 root（无缝交接）
-                if self.box_show_pending {
-                    self.box_pending_frames += 1;
-                    if self.box_pending_frames >= 2 {
-                        self.box_show_pending = false;
-                        box_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                        // root 移出屏幕并缩到 1x1，释放显存。
-                        // 注意：不能 Visible(false) —— eframe 对隐藏视口不调用 App::ui
-                        // （epi_integration.rs: if is_visible），immediate 子视口会被冻结。
-                        // 冻结截图与真实屏幕内容一致，root 移出瞬间视觉无缝。
-                        root_ctx.send_viewport_cmd_to(
-                            egui::ViewportId::ROOT,
-                            egui::ViewportCommand::OuterPosition(egui::pos2(-16000.0, -16000.0)),
-                        );
-                        root_ctx.send_viewport_cmd_to(
-                            egui::ViewportId::ROOT,
-                            egui::ViewportCommand::InnerSize(egui::vec2(1.0, 1.0)),
-                        );
+            if box_ctx.input(|i| i.viewport().close_requested()) {
+                eprintln!("selinga: box close requested -> quit");
+                root_ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+                return;
+            }
+
+            if self.box_show_pending {
+                self.box_pending_frames += 1;
+                let f = self.box_pending_frames;
+                if f == 1 {
+                    eprintln!("selinga: box viewport first frame");
+                    selinga_platform::exclude_self_from_capture();
+                    self.last_exclude = Instant::now();
+                }
+                if f == BOX_SHOW_AT_FRAME {
+                    eprintln!("selinga: t={}ms box revealed", self.t0.elapsed().as_millis());
+                    box_ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(sel.min));
+                    box_ctx.request_repaint();
+                }
+                if f >= BOX_HANDOFF_AT_FRAME {
+                    eprintln!(
+                        "selinga: t={}ms box handoff complete",
+                        self.t0.elapsed().as_millis()
+                    );
+                    self.box_show_pending = false;
+                    #[cfg(windows)]
+                    {
+                        self.select_bg = None;
                     }
                 }
+            }
 
-                if self.last_exclude.elapsed() > EXCLUDE_INTERVAL {
-                    self.last_exclude = Instant::now();
-                    selinga_platform::exclude_self_from_capture();
-                }
+            if self.last_exclude.elapsed() > EXCLUDE_INTERVAL {
+                self.last_exclude = Instant::now();
+                selinga_platform::exclude_self_from_capture();
+            }
 
-                let outer = box_ctx.input(|i| i.viewport().outer_rect);
-                let ppp = box_ctx.native_pixels_per_point().unwrap_or(1.0);
+            let outer = box_ctx.input(|i| i.viewport().outer_rect);
+            let ppp = box_ctx.native_pixels_per_point().unwrap_or(1.0);
 
-                if outer != self.last_rect {
-                    self.last_rect = outer;
-                    self.stable_since = Some(Instant::now());
-                }
-                let stable_for = self
-                    .stable_since
-                    .map(|t| t.elapsed())
-                    .unwrap_or(Duration::ZERO);
+            #[cfg(windows)]
+            self.update_live_background(&box_ctx, ppp, outer);
 
-                self.drain_worker(&box_ctx);
-                self.drain_tray(&box_ctx);
-                self.draw_box(ui, &box_ctx);
+            if outer != self.last_rect {
+                self.last_rect = outer;
+                self.stable_since = Some(Instant::now());
+            }
+            let stable_for = self
+                .stable_since
+                .map(|t| t.elapsed())
+                .unwrap_or(Duration::ZERO);
 
-                let pointer_idle = !box_ctx.input(|i| i.pointer.any_down());
-                let debounce_due = self.stable_since.is_some() && stable_for >= DEBOUNCE;
-                let poll_due = self.stable_since.is_none()
-                    && self
-                        .last_trigger
-                        .is_some_and(|t| t.elapsed() >= POLL_INTERVAL);
-                if (debounce_due || poll_due)
-                    && pointer_idle
-                    && !self.paused
-                    && !self.hidden
-                    && !self.busy
-                    && !self.dragging
-                    && self.resizing.is_none()
-                    && let Some(rect) = outer
-                {
-                    self.trigger(&box_ctx, rect, ppp, false);
-                }
+            self.drain_worker(&box_ctx);
+            self.drain_tray(&box_ctx);
+            self.draw_box(ui, &box_ctx);
 
-                self.draw_overlay_results(ui, ppp);
-            },
-        );
+            let pointer_idle = !box_ctx.input(|i| i.pointer.any_down());
+            let debounce_due = self.stable_since.is_some() && stable_for >= DEBOUNCE;
+            let poll_due = self.stable_since.is_none()
+                && self
+                    .last_trigger
+                    .is_some_and(|t| t.elapsed() >= POLL_INTERVAL);
+            if (debounce_due || poll_due)
+                && pointer_idle
+                && !self.paused
+                && !self.hidden
+                && !self.busy
+                && !self.dragging
+                && self.resizing.is_none()
+                && let Some(rect) = outer
+            {
+                self.trigger(&box_ctx, rect, ppp, false);
+            }
+
+            self.draw_overlay_results(ui, ppp);
+        });
     }
 
-    /// 延迟显示：等几何调整生效且至少画过一帧内容后再显示窗口（命令在 present 后应用，
-    /// 首个可见帧即完整内容），消除表面创建/重建时的黑屏闪帧
     fn handle_pending_show(&mut self, ctx: &egui::Context) {
         if !self.show_pending {
             return;
         }
         self.pending_frames += 1;
-        if self.pending_frames >= 2 {
+        if self.pending_frames >= self.show_after_frames {
             self.show_pending = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            eprintln!(
+                "selinga: t={}ms root revealed after {} frames",
+                self.t0.elapsed().as_millis(),
+                self.pending_frames
+            );
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
+            ctx.request_repaint();
         }
     }
 
-    /// 全屏抓一张作为框选背景。GL 表面不支持透明时（纯黑遮罩的根因），
-    /// 用"冻结屏幕 + 半透明暗纱"达到同样的视觉蒙版效果，且不依赖驱动。
     #[cfg(windows)]
     fn load_select_background(&mut self, ctx: &egui::Context) {
         let (w, h) = selinga_platform::primary_screen_px();
         let capture = match selinga_capture::win32::GdiCapture::new() {
             Ok(c) => c,
-            Err(_) => return,
+            Err(e) => {
+                eprintln!("selinga: bg capture new failed: {e}");
+                return;
+            }
         };
         let Ok(frame) = capture.capture_region(selinga_capture::Region { x: 0, y: 0, w, h }) else {
+            eprintln!("selinga: bg capture_region failed");
             return;
         };
+        eprintln!("selinga: bg loaded {}x{}", frame.width, frame.height);
         let image = egui::ColorImage::from_rgba_unmultiplied(
             [frame.width as usize, frame.height as usize],
             &frame.to_rgba(),
@@ -433,20 +467,31 @@ impl SelingaApp {
         self.select_bg = Some(ctx.load_texture("select_bg", image, egui::TextureOptions::LINEAR));
     }
 
+    fn draw_frozen_background(&self, ui: &egui::Ui) {
+        let rect = ui.max_rect();
+        let painter = ui.painter();
+        #[cfg(windows)]
+        {
+            if let Some(tex) = &self.select_bg {
+                painter.image(
+                    tex.id(),
+                    rect,
+                    egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            } else {
+                painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(70));
+            }
+        }
+        #[cfg(not(windows))]
+        painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(70));
+    }
+
     fn draw_select_overlay(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let rect = ui.max_rect();
         let painter = ui.painter().clone();
 
-        #[cfg(windows)]
-        if let Some(tex) = &self.select_bg {
-            painter.image(
-                tex.id(),
-                rect,
-                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
-        }
-        painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(70));
+        self.draw_frozen_background(ui);
 
         let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
         let pointer = ctx.input(|i| i.pointer.clone());
@@ -502,9 +547,7 @@ impl SelingaApp {
         }
     }
 
-    /// 结束框选：记录选区几何并切换到 Box 阶段（下一帧 spawn BOX 视口，创建即最终尺寸）；
-    /// `None` 或面积过小则取默认 380x240（屏幕居中）。root 全屏窗在 BOX 显示后才隐藏。
-    fn finish_select(&mut self, _ctx: &egui::Context, sel: Option<egui::Rect>) {
+    fn finish_select(&mut self, ctx: &egui::Context, sel: Option<egui::Rect>) {
         self.marquee = None;
         let valid = sel.is_some_and(|r| r.width() >= MIN_SELECT && r.height() >= MIN_SELECT);
         self.sel_rect = Some(if valid {
@@ -517,6 +560,11 @@ impl SelingaApp {
             )
         });
         self.phase = Phase::Box;
+        eprintln!(
+            "selinga: t={:.0}ms finish_select valid={valid} rect={:?}",
+            self.t0.elapsed().as_millis(),
+            self.sel_rect
+        );
         self.box_show_pending = true;
         self.box_pending_frames = 0;
         self.last_rect = None;
@@ -525,14 +573,64 @@ impl SelingaApp {
         self.result = None;
         self.translate_error = None;
         self.busy = false;
-        #[cfg(windows)]
-        {
-            self.select_bg = None;
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::OuterPosition(egui::pos2(-16000.0, -16000.0)),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::InnerSize(egui::vec2(1.0, 1.0)),
+        );
+        eprintln!(
+            "selinga: t={}ms root parked offscreen",
+            self.t0.elapsed().as_millis()
+        );
+        ctx.request_repaint();
+    }
+
+    #[cfg(windows)]
+    fn update_live_background(&mut self, ctx: &egui::Context, ppp: f32, outer: Option<egui::Rect>) {
+        let Some(rect) = outer else {
+            return;
+        };
+        let region = selinga_capture::Region {
+            x: (rect.min.x * ppp).round() as i32,
+            y: (rect.min.y * ppp).round() as i32,
+            w: (rect.width() * ppp).round() as u32,
+            h: (rect.height() * ppp).round() as u32,
+        };
+        let capture = match selinga_capture::win32::GdiCapture::new() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let Ok(frame) = capture.capture_region(region) else {
+            return;
+        };
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [frame.width as usize, frame.height as usize],
+            &frame.to_rgba(),
+        );
+        if self.live_bg.is_none() {
+            self.live_bg =
+                Some(ctx.load_texture("live_bg", image.clone(), egui::TextureOptions::LINEAR));
+            eprintln!("selinga: live bg {}x{}", frame.width, frame.height);
+        }
+        if let Some(tex) = self.live_bg.as_mut() {
+            tex.set(image, egui::TextureOptions::LINEAR);
         }
     }
 
     fn draw_box(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let rect = ui.max_rect();
+        #[cfg(windows)]
+        if let Some(tex) = &self.live_bg {
+            ui.painter().image(
+                tex.id(),
+                rect,
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
         ui.painter().rect_stroke(
             rect,
             6.0,
@@ -1004,8 +1102,51 @@ impl SelingaApp {
                         self.trigger(ctx, rect, ppp, true);
                     }
                 }
+                TrayCommand::Reselect => self.enter_select_mode(ctx),
                 TrayCommand::Quit => std::process::exit(0),
             }
+        }
+    }
+
+    #[cfg(windows)]
+    fn enter_select_mode(&mut self, ctx: &egui::Context) {
+        self.phase = Phase::Select;
+        self.sel_rect = None;
+        self.marquee = None;
+        self.hidden = false;
+        self.last_rect = None;
+        self.stable_since = None;
+        self.last_trigger = None;
+        self.result = None;
+        self.translate_error = None;
+        self.busy = false;
+        #[cfg(windows)]
+        {
+            self.select_bg = None;
+            self.live_bg = None;
+            if let Some(tray) = &self.tray {
+                tray.set_hidden_label(false);
+            }
+        }
+        ctx.send_viewport_cmd_to(box_viewport_id(), egui::ViewportCommand::Visible(false));
+        let (sw, sh) = selinga_platform::primary_screen_points();
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::InnerSize(egui::vec2(sw, sh)),
+        );
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+        self.show_pending = true;
+        self.pending_frames = 0;
+        self.show_after_frames = 2;
+        eprintln!("selinga: reselect -> root fullscreen pending show");
+    }
+
+    #[cfg(windows)]
+    fn drain_tray_quit_only(&mut self) {
+        if let Some(tray) = &self.tray
+            && tray.drain().contains(&TrayCommand::Quit)
+        {
+            std::process::exit(0);
         }
     }
 
