@@ -54,6 +54,10 @@ api_key = ""                              # 云端服务才需要；留空 = 无
 model = "qwen2.5:7b"
 ```
 
+> **隐私提示**：本地 OCR 不上传画面；但译文请求会把**识别出的文本**发送到腾讯 TranSmart /
+> Google / MyMemory 的公共接口。启用 `[vlm]` 后，**框选区域的截图会以 PNG 形式上上传**到
+> 你配置的端点——若内容敏感，请指向本地 Ollama 等自建服务。
+
 保存后重启生效。`enabled = true` 时视觉大模型同时接管识别与翻译：截图送 VLM 转录（失败自动回退 Windows OCR），译文链路变为 TranSmart → **VLM** → Google → MyMemory。托盘"AI 识别"可在运行时随时开关（状态写回配置），不用重启。
 
 ## 命令行调试工具
@@ -70,7 +74,7 @@ cargo run -p selinga-cli -- capture-ocr --region 100,200,800,400 --engine vlm   
 | 平台 | 状态 |
 |---|---|
 | Windows | ✅ 完整功能（GDI 截屏 + Windows.Media.Ocr） |
-| Linux / macOS | 编译通过，覆盖层功能开发中 |
+| Linux / macOS | ⚠️ 仅保证编译通过，框选/OCR/覆盖层尚未实现，Release 产物不可用 |
 
 ## 架构
 
@@ -82,7 +86,6 @@ selinga-ocr         OCR 后端抽象：Windows.Media.Ocr 封装（反色/对比�
 selinga-translate   Translator trait + TranSmart/Google/MyMemory/VLM 后端 + LRU 缓存 + 降级链
 selinga-pipeline    OCR 行与译文的结构化配对
 selinga-platform    截屏自我排除（WDA_EXCLUDEFROMCAPTURE）+ 主屏尺寸查询
-selinga-overlay-ui  覆盖层渲染原语
 selinga-app         egui 覆盖层主程序（双视口：全屏框选窗 + 方框窗；托盘/热键/触发调度/设置持久化）
 selinga-cli         调试 CLI
 ```
