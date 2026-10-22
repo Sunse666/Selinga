@@ -68,8 +68,7 @@ impl Translator for VlmTranslator {
             .and_then(Value::as_str)
             .ok_or_else(|| TranslateError::Backend("vlm: unexpected response".into()))?;
 
-        let out = split_reply(strip_code_fence(content), lines.len())?;
-        Ok(out)
+        Ok(split_reply(strip_code_fence(content), lines))
     }
 }
 
@@ -85,16 +84,22 @@ fn strip_code_fence(content: &str) -> &str {
     rest.trim_end().strip_suffix("```").unwrap_or(rest).trim()
 }
 
-fn split_reply(content: &str, expected: usize) -> Result<Vec<String>, TranslateError> {
-    let lines: Vec<String> = content.split('\n').map(str::to_owned).collect();
-    if lines.len() == expected {
-        Ok(lines)
-    } else {
-        Err(TranslateError::Backend(format!(
-            "vlm: expected {expected} lines, got {}",
-            lines.len()
-        )))
+// Models do not reliably honour the line count. Rather than failing the whole
+// backend (and paying for the request anyway), align the reply with the inputs:
+// drop trailing blank/extra lines, pad missing ones with the untranslated text.
+fn split_reply(content: &str, inputs: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = content
+        .split('\n')
+        .map(|line| line.trim_end().to_owned())
+        .collect();
+    while out.last().is_some_and(|line| line.is_empty()) {
+        out.pop();
     }
+    out.truncate(inputs.len());
+    for input in &inputs[out.len()..] {
+        out.push(input.clone());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -108,10 +113,31 @@ mod tests {
         assert_eq!(strip_code_fence("a\nb"), "a\nb");
     }
 
+    fn inputs(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("src{i}")).collect()
+    }
+
     #[test]
-    fn split_reply_checks_count() {
-        assert!(split_reply("a\nb", 2).is_ok());
-        assert!(split_reply("a\nb\nc", 2).is_err());
-        assert!(split_reply("", 1).is_ok());
+    fn split_reply_keeps_matching_count() {
+        assert_eq!(split_reply("a\nb", &inputs(2)), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn split_reply_truncates_extra_lines() {
+        assert_eq!(split_reply("a\nb\nc", &inputs(2)), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn split_reply_pads_missing_lines_with_source() {
+        assert_eq!(
+            split_reply("only", &inputs(3)),
+            vec!["only", "src1", "src2"]
+        );
+        assert_eq!(split_reply("", &inputs(1)), vec!["src0"]);
+    }
+
+    #[test]
+    fn split_reply_ignores_trailing_blank_lines() {
+        assert_eq!(split_reply("a\nb\n\n", &inputs(2)), vec!["a", "b"]);
     }
 }
