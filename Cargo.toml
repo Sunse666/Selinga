@@ -5,7 +5,6 @@ members = [
     "crates/selinga-cli",
     "crates/selinga-capture",
     "crates/selinga-ocr",
-    "crates/selinga-overlay-ui",
     "crates/selinga-pipeline",
     "crates/selinga-platform",
     "crates/selinga-translate",
@@ -23,7 +22,6 @@ selinga-ocr = { path = "crates/selinga-ocr" }
 selinga-translate = { path = "crates/selinga-translate" }
 selinga-platform = { path = "crates/selinga-platform" }
 selinga-pipeline = { path = "crates/selinga-pipeline" }
-selinga-overlay-ui = { path = "crates/selinga-overlay-ui" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
