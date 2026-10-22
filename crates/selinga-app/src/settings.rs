@@ -42,11 +42,14 @@ impl VlmSettings {
     }
 }
 
+const KNOWN_LANGS: [&str; 4] = ["zh-CN", "en-US", "ja-JP", "ko-KR"];
+const KNOWN_DISPLAY_MODES: [&str; 2] = ["translation", "bilingual"];
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            target_lang: "zh-CN".to_owned(),
-            display_mode: "translation".to_owned(),
+            target_lang: KNOWN_LANGS[0].to_owned(),
+            display_mode: KNOWN_DISPLAY_MODES[0].to_owned(),
             paused: false,
             vlm: VlmSettings::disabled(),
         }
@@ -74,25 +77,36 @@ impl Settings {
         base.map(|b| b.join("selinga").join("settings.toml"))
     }
 
+    // A single bad field used to discard the whole file and silently fall back
+    // to defaults; recover field by field instead so the rest of the config
+    // (paused state, [vlm] section) survives a bad value.
     fn load_from(path: &std::path::Path) -> Option<Self> {
         let text = std::fs::read_to_string(path).ok()?;
-        let settings: Settings = toml::from_str(&text).ok()?;
-        let known = ["zh-CN", "en-US", "ja-JP", "ko-KR"];
-        if !known.contains(&settings.target_lang.as_str()) {
-            return None;
+        let mut settings: Settings = toml::from_str(&text).ok()?;
+        if !KNOWN_LANGS.contains(&settings.target_lang.as_str()) {
+            settings.target_lang = KNOWN_LANGS[0].to_owned();
         }
-        if !["translation", "bilingual"].contains(&settings.display_mode.as_str()) {
-            return None;
+        if !KNOWN_DISPLAY_MODES.contains(&settings.display_mode.as_str()) {
+            settings.display_mode = KNOWN_DISPLAY_MODES[0].to_owned();
         }
         Some(settings)
     }
 
+    // Write to a sibling temp file and rename, so a crash mid-write cannot
+    // leave a truncated settings.toml behind.
     fn save_to(&self, path: &std::path::Path) {
-        if let Ok(text) = toml::to_string_pretty(self)
-            && let Some(dir) = path.parent()
-            && std::fs::create_dir_all(dir).is_ok()
-        {
-            let _ = std::fs::write(path, text);
+        let Ok(text) = toml::to_string_pretty(self) else {
+            return;
+        };
+        let Some(dir) = path.parent() else {
+            return;
+        };
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+        let tmp = path.with_extension("toml.tmp");
+        if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 }
@@ -128,30 +142,42 @@ mod tests {
     }
 
     #[test]
-    fn unknown_target_lang_rejected() {
+    fn unknown_target_lang_falls_back_to_default() {
         let path = temp_path("unknown-lang");
-        let s = Settings {
-            target_lang: "xx-XX".to_owned(),
-            display_mode: "translation".to_owned(),
-            paused: false,
-            vlm: VlmSettings::disabled(),
-        };
-        s.save_to(&path);
-        assert_eq!(Settings::load_from(&path), None);
+        std::fs::write(
+            &path,
+            "target_lang = \"xx-XX\"\ndisplay_mode = \"bilingual\"\npaused = true\n",
+        )
+        .unwrap();
+        let s = Settings::load_from(&path).unwrap();
+        assert_eq!(s.target_lang, "zh-CN");
+        assert_eq!(s.display_mode, "bilingual");
+        assert!(s.paused);
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn unknown_display_mode_rejected() {
+    fn unknown_display_mode_falls_back_to_default() {
         let path = temp_path("unknown-mode");
-        let s = Settings {
-            target_lang: "zh-CN".to_owned(),
-            display_mode: "side-by-side".to_owned(),
-            paused: false,
-            vlm: VlmSettings::disabled(),
-        };
+        std::fs::write(
+            &path,
+            "target_lang = \"ja-JP\"\ndisplay_mode = \"side-by-side\"\npaused = false\n",
+        )
+        .unwrap();
+        let s = Settings::load_from(&path).unwrap();
+        assert_eq!(s.display_mode, "translation");
+        assert_eq!(s.target_lang, "ja-JP");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_leaves_no_temp_file_behind() {
+        let path = temp_path("atomic");
+        let s = Settings::default();
         s.save_to(&path);
-        assert_eq!(Settings::load_from(&path), None);
+        assert!(path.exists());
+        assert!(!path.with_extension("toml.tmp").exists());
+        assert_eq!(Settings::load_from(&path), Some(s));
         let _ = std::fs::remove_file(&path);
     }
 
