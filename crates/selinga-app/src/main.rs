@@ -10,6 +10,7 @@ use selinga_translate::Translator;
 use std::sync::Arc;
 #[cfg(windows)]
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 mod settings;
@@ -35,6 +36,13 @@ const MIN_SELECT: f32 = 80.0;
 const DEFAULT_SIZE: [f32; 2] = [380.0, 240.0];
 const BOX_SHOW_AT_FRAME: u32 = 3;
 const BOX_HANDOFF_AT_FRAME: u32 = 8;
+const PIPELINE_TIMEOUT: Duration = Duration::from_secs(25);
+#[cfg(windows)]
+const LIVE_INTERVAL_ACTIVE: Duration = Duration::from_millis(100);
+#[cfg(windows)]
+const LIVE_INTERVAL_IDLE: Duration = Duration::from_millis(500);
+#[cfg(windows)]
+const LIVE_ACTIVE_WINDOW: Duration = Duration::from_secs(5);
 
 fn build_translator(
     target: &str,
@@ -191,6 +199,12 @@ struct SelingaApp {
     live_bg: Option<egui::TextureHandle>,
     #[cfg(windows)]
     select_bg: Option<egui::TextureHandle>,
+    pipeline_gen: Arc<AtomicU64>,
+    busy_since: Option<Instant>,
+    #[cfg(windows)]
+    live_fast_until: Instant,
+    #[cfg(windows)]
+    last_live_capture: Instant,
     t0: Instant,
     #[cfg(windows)]
     tray: Option<Tray>,
@@ -209,10 +223,14 @@ struct Worker {
 #[cfg(windows)]
 enum WorkerMsg {
     Done {
+        epoch: u64,
         output: PipelineOutput,
         translate_error: Option<String>,
     },
-    Failed(String),
+    Failed {
+        epoch: u64,
+        message: String,
+    },
 }
 
 impl SelingaApp {
@@ -268,6 +286,12 @@ impl SelingaApp {
             cache: Arc::new(Mutex::new(None)),
             #[cfg(windows)]
             worker: Some(Worker { tx, rx }),
+            pipeline_gen: Arc::new(AtomicU64::new(0)),
+            busy_since: None,
+            #[cfg(windows)]
+            live_fast_until: Instant::now(),
+            #[cfg(windows)]
+            last_live_capture: Instant::now(),
             t0: Instant::now(),
         };
         // The startup background capture only exists on Windows; on other
@@ -297,6 +321,72 @@ impl SelingaApp {
             vlm: self.vlm.clone(),
         }
         .save();
+    }
+
+    fn generation(&self) -> u64 {
+        self.pipeline_gen.load(Ordering::SeqCst)
+    }
+
+    // Config changes (target language, AI toggle) and timeouts both invalidate
+    // anything already in flight: bumping the generation makes late worker
+    // messages fail the epoch check and blocks their cache write. The busy flag
+    // is cleared here too - the stale result is discarded, so waiting for it
+    // would leave the box stuck on 'recognizing...' forever.
+    fn bump_generation(&mut self) {
+        self.pipeline_gen.fetch_add(1, Ordering::SeqCst);
+        self.busy = false;
+        self.busy_since = None;
+        #[cfg(windows)]
+        if let Ok(mut cache) = self.cache.lock() {
+            *cache = None;
+        }
+    }
+
+    fn rebuild_translator(&mut self) {
+        let target = TARGET_LANGS[self.target_lang];
+        let vlm = self.vlm.config();
+        if let Ok(mut guard) = self.translator.write() {
+            *guard = build_translator(target, vlm.as_ref());
+        }
+        self.bump_generation();
+    }
+
+    // Trigger the pipeline against the box's current screen rect. The toolbar
+    // refresh used to pass the viewport-local rect (origin 0,0), which captured
+    // whatever sat in the screen's top-left corner instead of the box.
+    fn refresh_now(&mut self, ctx: &egui::Context) {
+        if self.busy {
+            return;
+        }
+        let Some(rect) = self.last_rect else {
+            return;
+        };
+        let ppp = ctx.native_pixels_per_point().unwrap_or(1.0);
+        self.trigger(ctx, rect, ppp, true);
+    }
+
+    #[cfg(windows)]
+    fn note_activity(&mut self) {
+        self.live_fast_until = Instant::now() + LIVE_ACTIVE_WINDOW;
+    }
+
+    fn enforce_timeout(&mut self) -> bool {
+        if self.busy
+            && self
+                .busy_since
+                .is_some_and(|t| t.elapsed() >= PIPELINE_TIMEOUT)
+        {
+            self.bump_generation();
+            self.busy = false;
+            self.busy_since = None;
+            self.translate_error = None;
+            self.result = Some(Err(format!(
+                "pipeline timeout after {}s",
+                PIPELINE_TIMEOUT.as_secs()
+            )));
+            return true;
+        }
+        false
     }
 }
 
@@ -417,29 +507,28 @@ impl SelingaApp {
             if outer != self.last_rect {
                 self.last_rect = outer;
                 self.stable_since = Some(Instant::now());
+                #[cfg(windows)]
+                self.note_activity();
             }
-            let stable_for = self
-                .stable_since
-                .map(|t| t.elapsed())
-                .unwrap_or(Duration::ZERO);
 
             self.drain_worker(&box_ctx);
+            if self.enforce_timeout() {
+                box_ctx.request_repaint();
+            }
             self.drain_tray(&box_ctx);
             self.draw_box(ui, &box_ctx);
 
-            let pointer_idle = !box_ctx.input(|i| i.pointer.any_down());
-            let debounce_due = self.stable_since.is_some() && stable_for >= DEBOUNCE;
-            let poll_due = self.stable_since.is_none()
-                && self
-                    .last_trigger
-                    .is_some_and(|t| t.elapsed() >= POLL_INTERVAL);
-            if (debounce_due || poll_due)
-                && pointer_idle
-                && !self.paused
-                && !self.hidden
-                && !self.busy
-                && !self.dragging
-                && self.resizing.is_none()
+            let decision = trigger_decision(TriggerInput {
+                pointer_idle: !box_ctx.input(|i| i.pointer.any_down()),
+                paused: self.paused,
+                hidden: self.hidden,
+                busy: self.busy,
+                dragging: self.dragging,
+                resizing: self.resizing.is_some(),
+                stable_for: self.stable_since.map(|t| t.elapsed()),
+                since_trigger: self.last_trigger.map(|t| t.elapsed()),
+            });
+            if decision.is_some()
                 && let Some(rect) = outer
             {
                 self.trigger(&box_ctx, rect, ppp, false);
@@ -618,6 +707,15 @@ impl SelingaApp {
         let Some(rect) = outer else {
             return;
         };
+        let interval = if Instant::now() < self.live_fast_until {
+            LIVE_INTERVAL_ACTIVE
+        } else {
+            LIVE_INTERVAL_IDLE
+        };
+        if self.last_live_capture.elapsed() < interval {
+            return;
+        }
+        self.last_live_capture = Instant::now();
         let region = selinga_capture::Region {
             x: (rect.min.x * ppp).round() as i32,
             y: (rect.min.y * ppp).round() as i32,
@@ -696,6 +794,10 @@ impl SelingaApp {
         let resp = ui.allocate_rect(max_rect, egui::Sense::click_and_drag());
         let pointer = ctx.input(|i| i.pointer.clone());
         let pos = pointer.latest_pos();
+        #[cfg(windows)]
+        if resp.hovered() || pointer.any_down() {
+            self.note_activity();
+        }
         let resize_dir = resize_direction(rect, pos);
         let mut toolbar_hovered = false;
         if ui.rect_contains_pointer(rect) {
@@ -823,23 +925,18 @@ impl SelingaApp {
             (
                 Lang,
                 "target language",
-                Box::new(|app: &mut Self, _ui: &egui::Ui| {
+                Box::new(|app: &mut Self, ui: &egui::Ui| {
                     app.target_lang = (app.target_lang + 1) % TARGET_LANGS.len();
-                    let target = TARGET_LANGS[app.target_lang];
-                    if let Ok(mut g) = app.translator.write() {
-                        *g = build_translator(target, app.vlm.config().as_ref());
-                    }
+                    app.rebuild_translator();
                     app.persist_settings();
+                    app.refresh_now(ui.ctx());
                 }),
             ),
             (
                 Refresh,
                 "re-recognize",
                 Box::new(|app: &mut Self, ui: &egui::Ui| {
-                    if !app.busy {
-                        let ppp = ui.ctx().native_pixels_per_point().unwrap_or(1.0);
-                        app.trigger(ui.ctx(), ui.max_rect(), ppp, true);
-                    }
+                    app.refresh_now(ui.ctx());
                 }),
             ),
             (
@@ -1078,11 +1175,20 @@ impl SelingaApp {
     #[cfg(windows)]
     fn trigger(&mut self, _ctx: &egui::Context, rect: egui::Rect, ppp: f32, force: bool) {
         self.busy = true;
+        self.busy_since = Some(Instant::now());
         self.last_trigger = Some(Instant::now());
         self.stable_since = None;
+        // Only user-initiated runs count as activity; the 1 Hz content poll
+        // must not keep the live background at full frame rate.
+        if force {
+            self.note_activity();
+        }
+        let generation = self.generation();
+        let gen_shared = Arc::clone(&self.pipeline_gen);
 
         let Some(worker) = &self.worker else {
             self.busy = false;
+            self.busy_since = None;
             return;
         };
         let tx = worker.tx.clone();
@@ -1103,13 +1209,17 @@ impl SelingaApp {
         };
 
         std::thread::spawn(move || {
+            let fail = |message: String| WorkerMsg::Failed {
+                epoch: generation,
+                message,
+            };
             let capture = match selinga_capture::win32::GdiCapture::new() {
                 Ok(c) => c,
-                Err(e) => return send(&tx, WorkerMsg::Failed(e.to_string())),
+                Err(e) => return send(&tx, fail(e.to_string())),
             };
             let frame = match capture.capture_region(region) {
                 Ok(f) => f,
-                Err(e) => return send(&tx, WorkerMsg::Failed(format!("capture: {e}"))),
+                Err(e) => return send(&tx, fail(format!("capture: {e}"))),
             };
             let hash = frame_hash(&frame);
 
@@ -1120,6 +1230,7 @@ impl SelingaApp {
                 return send(
                     &tx,
                     WorkerMsg::Done {
+                        epoch: generation,
                         output: cached.output,
                         translate_error: None,
                     },
@@ -1128,11 +1239,11 @@ impl SelingaApp {
 
             let lines = match recognize_lines(&frame, vlm_endpoint.as_ref()) {
                 Ok(l) => l,
-                Err(e) => return send(&tx, WorkerMsg::Failed(format!("ocr: {e}"))),
+                Err(e) => return send(&tx, fail(format!("ocr: {e}"))),
             };
             let chain = match translator.read() {
                 Ok(g) => g.clone(),
-                Err(_) => return send(&tx, WorkerMsg::Failed("translator lock poisoned".into())),
+                Err(_) => return send(&tx, fail("translator lock poisoned".into())),
             };
             let sources: Vec<String> = lines.iter().map(|l| l.text.clone()).collect();
             let (translated, translate_error) = match chain.translate_lines(&sources) {
@@ -1150,7 +1261,11 @@ impl SelingaApp {
                     })
                     .collect(),
             };
-            if let Ok(mut c) = cache.lock() {
+            // A config change or timeout bumps the generation; anything this
+            // worker computed under the old generation must not poison the cache.
+            if gen_shared.load(Ordering::SeqCst) == generation
+                && let Ok(mut c) = cache.lock()
+            {
                 *c = Some(FrameCache {
                     hash,
                     output: output.clone(),
@@ -1159,6 +1274,7 @@ impl SelingaApp {
             send(
                 &tx,
                 WorkerMsg::Done {
+                    epoch: generation,
                     output,
                     translate_error,
                 },
@@ -1169,12 +1285,14 @@ impl SelingaApp {
     #[cfg(not(windows))]
     fn trigger(&mut self, _ctx: &egui::Context, _rect: egui::Rect, _ppp: f32, _force: bool) {
         self.busy = true;
+        self.busy_since = Some(Instant::now());
         self.stable_since = None;
         self.last_trigger = Some(Instant::now());
         self.result = Some(Err(
             "pipeline not implemented on this platform yet".to_owned()
         ));
         self.busy = false;
+        self.busy_since = None;
     }
 
     #[cfg(windows)]
@@ -1202,9 +1320,11 @@ impl SelingaApp {
                 TrayCommand::ToggleAi => {
                     self.vlm.enabled = !self.vlm.enabled;
                     self.persist_settings();
+                    self.rebuild_translator();
                     if let Some(tray) = &self.tray {
                         tray.set_ai_label(self.vlm.enabled);
                     }
+                    self.refresh_now(ctx);
                 }
                 TrayCommand::Refresh => {
                     if !self.busy
@@ -1270,18 +1390,27 @@ impl SelingaApp {
         let Some(worker) = &self.worker else {
             return;
         };
+        let current = self.generation();
         let mut done = false;
         while let Ok(msg) = worker.rx.try_recv() {
-            match msg {
+            let (epoch, outcome) = match msg {
                 WorkerMsg::Done {
+                    epoch,
                     output,
                     translate_error,
-                } => {
+                } => (epoch, Ok((output, translate_error))),
+                WorkerMsg::Failed { epoch, message } => (epoch, Err(message)),
+            };
+            if epoch != current {
+                continue;
+            }
+            match outcome {
+                Ok((output, translate_error)) => {
                     self.result = Some(Ok(output));
                     self.translate_error = translate_error;
                 }
-                WorkerMsg::Failed(err) => {
-                    self.result = Some(Err(err));
+                Err(message) => {
+                    self.result = Some(Err(message));
                     self.translate_error = None;
                 }
             }
@@ -1289,6 +1418,7 @@ impl SelingaApp {
         }
         if done {
             self.busy = false;
+            self.busy_since = None;
             ctx.request_repaint();
         }
     }
@@ -1473,5 +1603,145 @@ fn resize_cursor(dir: egui::ResizeDirection) -> egui::CursorIcon {
         egui::ResizeDirection::NorthEast | egui::ResizeDirection::SouthWest => {
             egui::CursorIcon::ResizeNeSw
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriggerKind {
+    Debounced,
+    Poll,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TriggerInput {
+    pointer_idle: bool,
+    paused: bool,
+    hidden: bool,
+    busy: bool,
+    dragging: bool,
+    resizing: bool,
+    stable_for: Option<Duration>,
+    since_trigger: Option<Duration>,
+}
+
+// Two-channel trigger: (A) geometry settled for DEBOUNCE, (B) a static box
+// polling every POLL_INTERVAL so scrolled content still refreshes. Dragging,
+// a busy worker, pause and hide all suppress both.
+fn trigger_decision(input: TriggerInput) -> Option<TriggerKind> {
+    if !input.pointer_idle
+        || input.paused
+        || input.hidden
+        || input.busy
+        || input.dragging
+        || input.resizing
+    {
+        return None;
+    }
+    match input.stable_for {
+        Some(stable) => (stable >= DEBOUNCE).then_some(TriggerKind::Debounced),
+        None => input
+            .since_trigger
+            .is_some_and(|d| d >= POLL_INTERVAL)
+            .then_some(TriggerKind::Poll),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn idle() -> TriggerInput {
+        TriggerInput {
+            pointer_idle: true,
+            paused: false,
+            hidden: false,
+            busy: false,
+            dragging: false,
+            resizing: false,
+            stable_for: None,
+            since_trigger: None,
+        }
+    }
+
+    #[test]
+    fn settled_geometry_triggers_debounce() {
+        let input = TriggerInput {
+            stable_for: Some(DEBOUNCE + Duration::from_millis(1)),
+            ..idle()
+        };
+        assert_eq!(trigger_decision(input), Some(TriggerKind::Debounced));
+    }
+
+    #[test]
+    fn settling_geometry_waits_for_debounce() {
+        let input = TriggerInput {
+            stable_for: Some(DEBOUNCE - Duration::from_millis(1)),
+            ..idle()
+        };
+        assert_eq!(trigger_decision(input), None);
+    }
+
+    #[test]
+    fn static_box_polls_after_interval() {
+        let input = TriggerInput {
+            since_trigger: Some(POLL_INTERVAL),
+            ..idle()
+        };
+        assert_eq!(trigger_decision(input), Some(TriggerKind::Poll));
+    }
+
+    #[test]
+    fn static_box_waits_for_poll_interval() {
+        let input = TriggerInput {
+            since_trigger: Some(POLL_INTERVAL - Duration::from_millis(1)),
+            ..idle()
+        };
+        assert_eq!(trigger_decision(input), None);
+    }
+
+    #[test]
+    fn dragging_suppresses_both_channels() {
+        let input = TriggerInput {
+            dragging: true,
+            stable_for: Some(DEBOUNCE * 4),
+            since_trigger: Some(POLL_INTERVAL * 4),
+            ..idle()
+        };
+        assert_eq!(trigger_decision(input), None);
+    }
+
+    #[test]
+    fn resizing_busy_paused_hidden_and_pointer_all_suppress() {
+        let flags = [
+            TriggerInput {
+                resizing: true,
+                ..idle()
+            },
+            TriggerInput {
+                busy: true,
+                ..idle()
+            },
+            TriggerInput {
+                paused: true,
+                ..idle()
+            },
+            TriggerInput {
+                hidden: true,
+                ..idle()
+            },
+            TriggerInput {
+                pointer_idle: false,
+                ..idle()
+            },
+        ];
+        for mut input in flags {
+            input.stable_for = Some(DEBOUNCE * 4);
+            assert_eq!(trigger_decision(input), None);
+        }
+    }
+
+    #[test]
+    fn never_triggered_box_stays_idle() {
+        assert_eq!(trigger_decision(idle()), None);
     }
 }
