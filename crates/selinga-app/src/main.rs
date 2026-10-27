@@ -30,13 +30,14 @@ fn mask_color() -> egui::Color32 {
 const TEXT_COLOR: egui::Color32 = egui::Color32::from_rgb(0xF2, 0xF2, 0xF5);
 const SOURCE_COLOR: egui::Color32 = egui::Color32::from_rgb(0x9A, 0x9A, 0xA8);
 const LINE_PAD: f32 = 3.0;
-const BILINGUAL_EXTRA: f32 = 0.62;
 const TARGET_LANGS: [&str; 4] = ["zh-CN", "en-US", "ja-JP", "ko-KR"];
 const MIN_SELECT: f32 = 80.0;
 const DEFAULT_SIZE: [f32; 2] = [380.0, 240.0];
 const BOX_SHOW_AT_FRAME: u32 = 3;
 const BOX_HANDOFF_AT_FRAME: u32 = 8;
 const PIPELINE_TIMEOUT: Duration = Duration::from_secs(25);
+const AI_TIMEOUT: Duration = Duration::from_secs(120);
+const SETTINGS_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(windows)]
 const LIVE_INTERVAL_ACTIVE: Duration = Duration::from_millis(100);
 #[cfg(windows)]
@@ -44,18 +45,10 @@ const LIVE_INTERVAL_IDLE: Duration = Duration::from_millis(500);
 #[cfg(windows)]
 const LIVE_ACTIVE_WINDOW: Duration = Duration::from_secs(5);
 
-fn build_translator(
-    target: &str,
-    vlm: Option<&selinga_translate::vlm::VlmConfig>,
-) -> Arc<dyn Translator> {
+fn build_translator(target: &str) -> Arc<dyn Translator> {
     let mut backends: Vec<Box<dyn Translator>> = vec![Box::new(
         selinga_translate::tencent::TransmartTranslator::new(target),
     )];
-    if let Some(cfg) = vlm {
-        backends.push(Box::new(selinga_translate::vlm::VlmTranslator::new(
-            cfg.clone(),
-        )));
-    }
     backends.push(Box::new(selinga_translate::google::GoogleTranslator::new(
         target,
     )));
@@ -76,6 +69,7 @@ enum ToolbarIcon {
     Copy,
     Lang,
     Refresh,
+    Ai,
     Pause,
     Resume,
 }
@@ -85,6 +79,7 @@ enum ToolbarIcon {
 struct FrameCache {
     hash: u64,
     output: PipelineOutput,
+    ai: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,11 +97,68 @@ impl DisplayMode {
     }
 }
 
+fn display_mode_from(value: &str) -> DisplayMode {
+    match value {
+        "bilingual" => DisplayMode::Bilingual,
+        _ => DisplayMode::Translation,
+    }
+}
+
+fn log_event(message: &str) {
+    use std::io::Write;
+    let Some(dir) = Settings::path().and_then(|path| path.parent().map(|p| p.to_path_buf())) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("selinga.log");
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 1_000_000) {
+        let _ = std::fs::rename(&path, dir.join("selinga.log.1"));
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{} {message}", timestamp());
+    }
+}
+
+fn timestamp() -> String {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::SystemInformation::GetLocalTime;
+        let time = GetLocalTime();
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        String::from("----")
+    }
+}
+
+fn settings_mtime() -> Option<std::time::SystemTime> {
+    let path = Settings::path()?;
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
 fn main() -> eframe::Result<()> {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log_event(&format!("panic: {info}"));
+        default_hook(info);
+    }));
+    if !selinga_platform::single_instance() {
+        log_event("another instance is running; activated it and exited");
+        return Ok(());
+    }
     let (screen_w, screen_h) = selinga_platform::primary_screen_points();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Selinga")
+            .with_taskbar(false)
             .with_decorations(false)
             .with_transparent(true)
             .with_resizable(true)
@@ -183,9 +235,13 @@ struct SelingaApp {
     copied_at: Option<Instant>,
     result: Option<Result<PipelineOutput, String>>,
     translate_error: Option<String>,
+    notice: Option<String>,
+    pending_ai: bool,
+    result_ai: bool,
     target_lang: usize,
     translator: Arc<std::sync::RwLock<Arc<dyn Translator>>>,
     vlm: settings::VlmSettings,
+    hotkeys: settings::HotkeySettings,
     hidden: bool,
     phase: Phase,
     sel_rect: Option<egui::Rect>,
@@ -201,6 +257,8 @@ struct SelingaApp {
     select_bg: Option<egui::TextureHandle>,
     pipeline_gen: Arc<AtomicU64>,
     busy_since: Option<Instant>,
+    settings_mtime: Option<std::time::SystemTime>,
+    last_settings_check: Instant,
     #[cfg(windows)]
     live_fast_until: Instant,
     #[cfg(windows)]
@@ -224,11 +282,13 @@ struct Worker {
 enum WorkerMsg {
     Done {
         epoch: u64,
+        ai: bool,
         output: PipelineOutput,
         translate_error: Option<String>,
     },
     Failed {
         epoch: u64,
+        ai: bool,
         message: String,
     },
 }
@@ -237,17 +297,23 @@ impl SelingaApp {
     fn new(ctx: &egui::Context) -> Self {
         #[cfg(windows)]
         let (tx, rx) = std::sync::mpsc::channel();
-        let saved = Settings::load();
+        let (saved, broken_settings) = Settings::load_or_recover();
         let target_lang = TARGET_LANGS
             .iter()
             .position(|l| *l == saved.target_lang)
             .unwrap_or(0);
-        let display_mode = match saved.display_mode.as_str() {
-            "bilingual" => DisplayMode::Bilingual,
-            _ => DisplayMode::Translation,
+        let display_mode = display_mode_from(&saved.display_mode);
+        let settings_mtime = settings_mtime();
+        #[cfg(windows)]
+        let (tray, tray_error, failed_hotkeys) = match Tray::new(&saved.hotkeys) {
+            Ok(tray) => {
+                let failed = tray.failed.clone();
+                (Some(tray), None, failed)
+            }
+            Err(err) => (None, Some(err), Vec::new()),
         };
         let app = Self {
-            paused: saved.paused,
+            paused: false,
             busy: false,
             dragging: false,
             resizing: None,
@@ -261,6 +327,9 @@ impl SelingaApp {
             copied_at: None,
             result: None,
             translate_error: None,
+            notice: None,
+            pending_ai: false,
+            result_ai: false,
             target_lang,
             hidden: false,
             phase: Phase::Select,
@@ -276,66 +345,85 @@ impl SelingaApp {
             #[cfg(windows)]
             select_bg: None,
             vlm: saved.vlm.clone(),
+            hotkeys: saved.hotkeys.clone(),
             translator: Arc::new(std::sync::RwLock::new(build_translator(
                 TARGET_LANGS[target_lang],
-                saved.vlm.config().as_ref(),
             ))),
             #[cfg(windows)]
-            tray: Tray::new().ok(),
+            tray,
             #[cfg(windows)]
             cache: Arc::new(Mutex::new(None)),
             #[cfg(windows)]
             worker: Some(Worker { tx, rx }),
             pipeline_gen: Arc::new(AtomicU64::new(0)),
             busy_since: None,
+            settings_mtime,
+            last_settings_check: Instant::now(),
             #[cfg(windows)]
             live_fast_until: Instant::now(),
             #[cfg(windows)]
             last_live_capture: Instant::now(),
             t0: Instant::now(),
         };
-        // The startup background capture only exists on Windows; on other
-        // platforms neither the context nor mutability is needed.
         #[cfg(windows)]
         let app = {
             let mut app = app;
             app.load_select_background(ctx);
-            if let Some(tray) = &app.tray {
-                tray.set_ai_label(app.vlm.enabled);
+            if let Some(err) = &tray_error {
+                log_event(&format!("tray unavailable: {err}"));
+                app.notice = Some(format!("托盘不可用：{err}"));
             }
+            if broken_settings.is_some() {
+                log_event("settings unreadable; original moved to settings.toml.broken");
+                app.notice = Some("配置无法解析，已备份为 settings.toml.broken".to_owned());
+            }
+            if !failed_hotkeys.is_empty() {
+                let list = failed_hotkeys.join("、");
+                log_event(&format!("hotkeys not registered: {list}"));
+                app.notice = Some(format!("热键未注册：{list}"));
+            }
+
             app
         };
         #[cfg(not(windows))]
         let _ = ctx;
+        {
+            log_event(&format!(
+                "start: settings={}",
+                Settings::path()
+                    .map_or_else(|| "<none>".to_owned(), |path| path.display().to_string())
+            ));
+        }
         app
     }
 
-    fn persist_settings(&self) {
+    fn current_settings(&self) -> Settings {
         Settings {
             target_lang: TARGET_LANGS[self.target_lang].to_owned(),
             display_mode: match self.display_mode {
                 DisplayMode::Translation => "translation".to_owned(),
                 DisplayMode::Bilingual => "bilingual".to_owned(),
             },
-            paused: self.paused,
+            paused: false,
             vlm: self.vlm.clone(),
+            hotkeys: self.hotkeys.clone(),
         }
-        .save();
+    }
+
+    fn persist_settings(&mut self) {
+        self.current_settings().save();
+        self.settings_mtime = settings_mtime();
     }
 
     fn generation(&self) -> u64 {
         self.pipeline_gen.load(Ordering::SeqCst)
     }
 
-    // Config changes (target language, AI toggle) and timeouts both invalidate
-    // anything already in flight: bumping the generation makes late worker
-    // messages fail the epoch check and blocks their cache write. The busy flag
-    // is cleared here too - the stale result is discarded, so waiting for it
-    // would leave the box stuck on 'recognizing...' forever.
     fn bump_generation(&mut self) {
         self.pipeline_gen.fetch_add(1, Ordering::SeqCst);
         self.busy = false;
         self.busy_since = None;
+        self.pending_ai = false;
         #[cfg(windows)]
         if let Ok(mut cache) = self.cache.lock() {
             *cache = None;
@@ -344,16 +432,12 @@ impl SelingaApp {
 
     fn rebuild_translator(&mut self) {
         let target = TARGET_LANGS[self.target_lang];
-        let vlm = self.vlm.config();
         if let Ok(mut guard) = self.translator.write() {
-            *guard = build_translator(target, vlm.as_ref());
+            *guard = build_translator(target);
         }
         self.bump_generation();
     }
 
-    // Trigger the pipeline against the box's current screen rect. The toolbar
-    // refresh used to pass the viewport-local rect (origin 0,0), which captured
-    // whatever sat in the screen's top-left corner instead of the box.
     fn refresh_now(&mut self, ctx: &egui::Context) {
         if self.busy {
             return;
@@ -365,24 +449,94 @@ impl SelingaApp {
         self.trigger(ctx, rect, ppp, true);
     }
 
+    fn open_settings_file(&mut self) {
+        let Some(path) = Settings::path() else {
+            return;
+        };
+        let has_vlm_section = std::fs::read_to_string(&path)
+            .map(|text| text.contains("[vlm]"))
+            .unwrap_or(false);
+        if !has_vlm_section {
+            self.persist_settings();
+        }
+        log_event(&format!("open config: {}", path.display()));
+        if let Err(err) = selinga_platform::open_in_editor(&path) {
+            log_event(&format!("open config failed: {err}"));
+            self.notice = Some(format!("open config failed: {err}"));
+        }
+    }
+
+    fn reload_settings_if_changed(&mut self, ctx: &egui::Context) {
+        if self.last_settings_check.elapsed() < SETTINGS_CHECK_INTERVAL {
+            return;
+        }
+        self.last_settings_check = Instant::now();
+        let Some(modified) = settings_mtime() else {
+            return;
+        };
+        if self.settings_mtime == Some(modified) {
+            return;
+        }
+        self.settings_mtime = Some(modified);
+        let Some(path) = Settings::path() else {
+            return;
+        };
+        let Some(loaded) = Settings::load_from(&path) else {
+            return;
+        };
+        if loaded == self.current_settings() {
+            return;
+        }
+        self.apply_settings(loaded, ctx);
+    }
+
+    fn apply_settings(&mut self, loaded: Settings, ctx: &egui::Context) {
+        let hotkeys_changed = loaded.hotkeys != self.hotkeys;
+        if let Some(index) = TARGET_LANGS.iter().position(|l| *l == loaded.target_lang) {
+            self.target_lang = index;
+        }
+        self.display_mode = display_mode_from(&loaded.display_mode);
+        self.vlm = loaded.vlm;
+        self.hotkeys = loaded.hotkeys;
+        self.rebuild_translator();
+        #[cfg(windows)]
+        if hotkeys_changed {
+            self.tray = Tray::new(&self.hotkeys).ok();
+        }
+        #[cfg(windows)]
+        if let Some(tray) = &self.tray {
+            tray.set_hidden_label(self.hidden);
+            tray.set_paused_label(self.paused);
+        }
+        log_event(&format!(
+            "settings reloaded: lang={} mode={:?} paused={} hotkeys_changed={hotkeys_changed}",
+            TARGET_LANGS[self.target_lang], self.display_mode, self.paused
+        ));
+        self.refresh_now(ctx);
+    }
+
     #[cfg(windows)]
     fn note_activity(&mut self) {
         self.live_fast_until = Instant::now() + LIVE_ACTIVE_WINDOW;
     }
 
     fn enforce_timeout(&mut self) -> bool {
-        if self.busy
-            && self
-                .busy_since
-                .is_some_and(|t| t.elapsed() >= PIPELINE_TIMEOUT)
-        {
+        let budget = if self.pending_ai {
+            AI_TIMEOUT
+        } else {
+            PIPELINE_TIMEOUT
+        };
+        if self.busy && self.busy_since.is_some_and(|t| t.elapsed() >= budget) {
+            let pending_ai = self.pending_ai;
             self.bump_generation();
             self.busy = false;
             self.busy_since = None;
+            self.pending_ai = false;
             self.translate_error = None;
             self.result = Some(Err(format!(
-                "pipeline timeout after {}s",
-                PIPELINE_TIMEOUT.as_secs()
+                "{} timeout after {}s",
+                if pending_ai { "AI" } else { "pipeline" },
+                budget.as_secs()
             )));
             return true;
         }
@@ -402,6 +556,10 @@ impl eframe::App for SelingaApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
+        if self.enforce_timeout() {
+            ctx.request_repaint();
+        }
+
         match self.phase {
             Phase::Select => {
                 #[cfg(windows)]
@@ -410,7 +568,8 @@ impl eframe::App for SelingaApp {
                 }
                 self.draw_select_overlay(ui, &ctx);
                 #[cfg(windows)]
-                self.drain_tray_quit_only();
+                self.drain_tray_select_phase();
+                self.reload_settings_if_changed(&ctx);
                 self.handle_pending_show(&ctx);
                 if self.show_pending {
                     ctx.request_repaint();
@@ -441,6 +600,7 @@ impl SelingaApp {
         };
         let builder = egui::ViewportBuilder::default()
             .with_title("Selinga Box")
+            .with_taskbar(false)
             .with_decorations(false)
             .with_transparent(true)
             .with_resizable(true)
@@ -497,9 +657,6 @@ impl SelingaApp {
             let ppp = box_ctx.native_pixels_per_point().unwrap_or(1.0);
 
             #[cfg(windows)]
-            // While a drag/resize is in flight, per-frame capture reads black
-            // for the area behind a moving excluded window; the frozen
-            // snapshot taken at drag start covers those frames instead.
             if !self.dragging && self.resizing.is_none() {
                 self.update_live_background(&box_ctx, ppp, outer);
             }
@@ -512,10 +669,8 @@ impl SelingaApp {
             }
 
             self.drain_worker(&box_ctx);
-            if self.enforce_timeout() {
-                box_ctx.request_repaint();
-            }
             self.drain_tray(&box_ctx);
+            self.reload_settings_if_changed(&box_ctx);
             self.draw_box(ui, &box_ctx);
 
             let decision = trigger_decision(TriggerInput {
@@ -533,8 +688,6 @@ impl SelingaApp {
             {
                 self.trigger(&box_ctx, rect, ppp, false);
             }
-
-            self.draw_overlay_results(ui, ppp);
         });
     }
 
@@ -686,7 +839,9 @@ impl SelingaApp {
         self.last_trigger = None;
         self.result = None;
         self.translate_error = None;
-        self.busy = false;
+        self.notice = None;
+        self.result_ai = false;
+        self.bump_generation();
         ctx.send_viewport_cmd_to(
             egui::ViewportId::ROOT,
             egui::ViewportCommand::OuterPosition(egui::pos2(-16000.0, -16000.0)),
@@ -745,12 +900,6 @@ impl SelingaApp {
 
     fn draw_box(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let max_rect = ui.max_rect();
-        // While a manual drag/resize is in flight the OS window already sits
-        // at the target geometry (SetWindowPos ran synchronously before this
-        // frame paints); paint at that geometry so nothing trails behind.
-        // drag_rect is in SCREEN coordinates (for SetWindowPos and snapshot
-        // sampling); painting and hit-testing must use the window-local
-        // canvas rect of the same size.
         let rect = match self.drag_rect {
             Some(r) => egui::Rect::from_min_size(egui::Pos2::ZERO, r.size()),
             None => max_rect,
@@ -760,12 +909,6 @@ impl SelingaApp {
         #[cfg(windows)]
         {
             if let Some(tex) = &self.select_bg {
-                // Frozen full-screen snapshot taken at drag start: sample the
-                // exact screen slice the window covers right now (drag_rect
-                // is in screen coordinates) and draw it into the window-local
-                // canvas, so the interior stays see-through while moving (a
-                // live re-capture reads black behind a moving excluded
-                // window).
                 let ts = tex.size_vec2();
                 let uv = match self.drag_rect {
                     Some(r) => egui::Rect::from_min_max(
@@ -784,6 +927,8 @@ impl SelingaApp {
                 );
             }
         }
+        self.draw_overlay_results(ui, ppp);
+
         painter.rect_stroke(
             rect,
             6.0,
@@ -804,6 +949,15 @@ impl SelingaApp {
             toolbar_hovered = self.draw_toolbar(ui, rect);
         }
         self.draw_status_badge(ui, rect);
+        if self.result_ai {
+            ui.painter().text(
+                egui::pos2(rect.right() - 8.0, rect.bottom() - 6.0),
+                egui::Align2::RIGHT_BOTTOM,
+                "AI",
+                egui::FontId::proportional(10.0),
+                SOURCE_COLOR,
+            );
+        }
 
         if !pointer.any_down() {
             if let Some(dir) = resize_dir {
@@ -819,11 +973,6 @@ impl SelingaApp {
             }
         }
 
-        // Manual drag/resize loop. The native modal loop (StartDrag /
-        // BeginResize) moves the window outline ahead of our GL content,
-        // which reads as a trailing border. Instead, on every frame with the
-        // button held, apply the new rect synchronously via SetWindowPos
-        // before this frame is presented.
         let outer = ctx.input(|i| i.viewport().outer_rect);
         let pointer_screen = pos.and_then(|p| outer.map(|o| o.min + p.to_vec2()));
 
@@ -834,8 +983,6 @@ impl SelingaApp {
                 self.dragging = true;
             }
             if self.dragging || self.resizing.is_some() {
-                // Freeze the desktop once; the drag loop samples slices of it
-                // instead of re-capturing behind a moving window.
                 #[cfg(windows)]
                 if self.select_bg.is_none() {
                     self.select_bg = self.capture_screen_texture(ctx);
@@ -855,6 +1002,8 @@ impl SelingaApp {
                 Some(dir) => resize_rect(start, delta, dir),
                 None => start.translate(delta),
             };
+            let (screen_w, screen_h) = selinga_platform::primary_screen_points();
+            let next = clamp_rect(next, screen_w, screen_h);
             let applied = selinga_platform::set_window_geometry_px(
                 "Selinga Box",
                 (next.min.x * ppp).round() as i32,
@@ -863,7 +1012,6 @@ impl SelingaApp {
                 (next.height() * ppp).round() as i32,
             );
             if !applied {
-                // Non-Windows fallback: deferred commands still track drags.
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(next.min));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(next.size()));
             }
@@ -876,8 +1024,6 @@ impl SelingaApp {
             self.resizing = None;
             self.drag_anchor = None;
             self.drag_rect = None;
-            // Drop the frozen snapshot; the per-frame live capture resumes
-            // and converges on the settled geometry.
             #[cfg(windows)]
             {
                 self.select_bg = None;
@@ -887,7 +1033,7 @@ impl SelingaApp {
 
     #[allow(clippy::too_many_lines)]
     fn draw_toolbar(&mut self, ui: &mut egui::Ui, box_rect: egui::Rect) -> bool {
-        use ToolbarIcon::{Copy, Lang, Mode, Pause, Refresh, Resume};
+        use ToolbarIcon::{Ai, Copy, Lang, Mode, Pause, Refresh, Resume};
 
         let lang_code = TARGET_LANGS[self.target_lang]
             .split('-')
@@ -898,6 +1044,7 @@ impl SelingaApp {
             DisplayMode::Translation => "switch to bilingual",
             DisplayMode::Bilingual => "switch to translation only",
         };
+        let ai_ready = self.vlm.config().is_some();
         let buttons: Vec<(ToolbarIcon, &str, ToolbarAction)> = vec![
             (
                 Mode,
@@ -940,6 +1087,17 @@ impl SelingaApp {
                 }),
             ),
             (
+                Ai,
+                if ai_ready {
+                    "AI image recognition"
+                } else {
+                    "AI 未配置"
+                },
+                Box::new(|app: &mut Self, ui: &egui::Ui| {
+                    app.trigger_ai(ui.ctx());
+                }),
+            ),
+            (
                 if self.paused { Resume } else { Pause },
                 if self.paused { "resume" } else { "pause" },
                 Box::new(|app: &mut Self, _ui: &egui::Ui| {
@@ -964,7 +1122,7 @@ impl SelingaApp {
             egui::vec2(ICON + 10.0, total_h + 10.0),
         );
         let painter = ui.painter().clone();
-        painter.rect_filled(column_rect, 8.0, egui::Color32::from_black_alpha(110));
+        painter.rect_filled(column_rect, 8.0, egui::Color32::from_black_alpha(210));
 
         let pointer_pos = ui.input(|i| i.pointer.latest_pos());
         let mut any_hovered = false;
@@ -1038,6 +1196,20 @@ impl SelingaApp {
                         egui::Stroke::NONE,
                     ));
                 }
+                ToolbarIcon::Ai => {
+                    let color = if ai_ready {
+                        color
+                    } else {
+                        color.gamma_multiply(0.45)
+                    };
+                    painter.text(
+                        btn_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "AI",
+                        egui::FontId::proportional(9.5),
+                        color,
+                    );
+                }
                 ToolbarIcon::Pause => {
                     let c = btn_rect.center();
                     for x_off in [-4.5_f32, 1.5] {
@@ -1083,9 +1255,17 @@ impl SelingaApp {
     fn draw_status_badge(&mut self, ui: &mut egui::Ui, box_rect: egui::Rect) {
         const WARN_COLOR: egui::Color32 = egui::Color32::from_rgb(0xE2, 0xA1, 0x4B);
         let (text, color): (String, egui::Color32) = if self.busy {
-            ("recognizing...".to_owned(), SOURCE_COLOR)
+            let label = if self.pending_ai {
+                "AI image recognition..."
+            } else {
+                "recognizing..."
+            };
+            (label.to_owned(), SOURCE_COLOR)
         } else if self.paused {
             ("paused".to_owned(), SOURCE_COLOR)
+        } else if let Some(notice) = &self.notice {
+            let short: String = notice.chars().take(72).collect();
+            (short, WARN_COLOR)
         } else if let Some(err) = &self.translate_error {
             let short: String = format!("translate: {}", err.chars().take(56).collect::<String>());
             (short, WARN_COLOR)
@@ -1118,6 +1298,9 @@ impl SelingaApp {
             let Some(bbox) = pair.rect else {
                 continue;
             };
+            if pair.translated.trim().is_empty() {
+                continue;
+            }
             let line = egui::Rect::from_min_size(
                 egui::pos2(bbox.x / ppp, bbox.y / ppp),
                 egui::vec2(bbox.w / ppp, bbox.h / ppp),
@@ -1129,14 +1312,9 @@ impl SelingaApp {
                     fit_font_size(&ctx, &pair.translated, avail_w, line.height())
                 }
                 DisplayMode::Bilingual => {
-                    fit_font_size(&ctx, &pair.translated, avail_w, line.height() * 0.72)
+                    fit_font_size(&ctx, &pair.translated, avail_w, line.height() * 0.5)
                 }
             };
-            let mask_height = match mode {
-                DisplayMode::Translation => mask.height(),
-                DisplayMode::Bilingual => mask.height() * (1.0 + BILINGUAL_EXTRA),
-            };
-            let mask = egui::Rect::from_min_size(mask.min, egui::vec2(mask.width(), mask_height));
             painter.rect_filled(mask, 3.0, mask_color());
             let max_chars = (mask.width() / (font_size * 0.6)).max(4.0) as usize;
             match mode {
@@ -1174,12 +1352,42 @@ impl SelingaApp {
 
     #[cfg(windows)]
     fn trigger(&mut self, _ctx: &egui::Context, rect: egui::Rect, ppp: f32, force: bool) {
+        self.spawn_worker(rect, ppp, force, false);
+    }
+
+    #[cfg(windows)]
+    fn trigger_ai(&mut self, ctx: &egui::Context) {
+        if self.busy {
+            return;
+        }
+        if self.paused || self.hidden {
+            let reason = if self.paused {
+                "已暂停"
+            } else {
+                "方框已隐藏"
+            };
+            self.notice = Some(format!("{reason}：先恢复再试"));
+            return;
+        }
+        if self.vlm.config().is_none() {
+            self.notice = Some("AI 未配置：托盘 → 配置文件".to_owned());
+            return;
+        }
+        let Some(rect) = self.last_rect else {
+            return;
+        };
+        let ppp = ctx.native_pixels_per_point().unwrap_or(1.0);
+        self.pending_ai = true;
+        self.spawn_worker(rect, ppp, true, true);
+    }
+
+    #[cfg(windows)]
+    fn spawn_worker(&mut self, rect: egui::Rect, ppp: f32, force: bool, ai: bool) {
+        self.notice = None;
         self.busy = true;
         self.busy_since = Some(Instant::now());
         self.last_trigger = Some(Instant::now());
         self.stable_since = None;
-        // Only user-initiated runs count as activity; the 1 Hz content poll
-        // must not keep the live background at full frame rate.
         if force {
             self.note_activity();
         }
@@ -1189,18 +1397,14 @@ impl SelingaApp {
         let Some(worker) = &self.worker else {
             self.busy = false;
             self.busy_since = None;
+            self.pending_ai = false;
             return;
         };
         let tx = worker.tx.clone();
         let cache = Arc::clone(&self.cache);
         let translator = Arc::clone(&self.translator);
-        // VLM endpoint drives both the OCR engine choice and the translator
-        // chain (build_translator appends VlmTranslator when configured).
-        let vlm_endpoint = self.vlm.config().map(|c| selinga_ocr::vlm::VlmEndpoint {
-            base_url: c.base_url,
-            api_key: c.api_key,
-            model: c.model,
-        });
+        let ai_config = if ai { self.vlm.config() } else { None };
+        let target_lang = TARGET_LANGS[self.target_lang].to_owned();
         let region = selinga_capture::Region {
             x: (rect.min.x * ppp).round() as i32,
             y: (rect.min.y * ppp).round() as i32,
@@ -1209,9 +1413,13 @@ impl SelingaApp {
         };
 
         std::thread::spawn(move || {
-            let fail = |message: String| WorkerMsg::Failed {
-                epoch: generation,
-                message,
+            let fail = |message: String| {
+                log_event(&format!("pipeline failed (ai={ai}): {message}"));
+                WorkerMsg::Failed {
+                    epoch: generation,
+                    ai,
+                    message,
+                }
             };
             let capture = match selinga_capture::win32::GdiCapture::new() {
                 Ok(c) => c,
@@ -1223,7 +1431,8 @@ impl SelingaApp {
             };
             let hash = frame_hash(&frame);
 
-            if !force
+            if !ai
+                && !force
                 && let Some(cached) = cache.lock().ok().and_then(|c| c.clone())
                 && cached.hash == hash
             {
@@ -1231,24 +1440,41 @@ impl SelingaApp {
                     &tx,
                     WorkerMsg::Done {
                         epoch: generation,
+                        ai: cached.ai,
                         output: cached.output,
                         translate_error: None,
                     },
                 );
             }
 
-            let lines = match recognize_lines(&frame, vlm_endpoint.as_ref()) {
-                Ok(l) => l,
-                Err(e) => return send(&tx, fail(format!("ocr: {e}"))),
-            };
-            let chain = match translator.read() {
-                Ok(g) => g.clone(),
-                Err(_) => return send(&tx, fail("translator lock poisoned".into())),
-            };
-            let sources: Vec<String> = lines.iter().map(|l| l.text.clone()).collect();
-            let (translated, translate_error) = match chain.translate_lines(&sources) {
-                Ok(t) => (t, None),
-                Err(e) => (sources.clone(), Some(e.to_string())),
+            let (lines, translated, translate_error) = if ai {
+                let Some(config) = ai_config else {
+                    return send(&tx, fail("AI 未配置".to_owned()));
+                };
+                match ai_pass(&frame, &config, &target_lang) {
+                    Ok((lines, translated)) => {
+                        if lines.is_empty() {
+                            return send(&tx, fail("AI 未识别到文字".to_owned()));
+                        }
+                        (lines, translated, None)
+                    }
+                    Err(e) => return send(&tx, fail(e)),
+                }
+            } else {
+                let lines = match recognize_local(&frame) {
+                    Ok(lines) => lines,
+                    Err(e) => return send(&tx, fail(format!("ocr: {e}"))),
+                };
+                let sources: Vec<String> = lines.iter().map(|l| l.text.clone()).collect();
+                let chain = match translator.read() {
+                    Ok(g) => g.clone(),
+                    Err(_) => return send(&tx, fail("translator lock poisoned".into())),
+                };
+                let (translated, translate_error) = match chain.translate_lines(&sources) {
+                    Ok(t) => (t, None),
+                    Err(e) => (sources.clone(), Some(e.to_string())),
+                };
+                (lines, translated, translate_error)
             };
             let output = selinga_pipeline::PipelineOutput {
                 lines: lines
@@ -1256,30 +1482,35 @@ impl SelingaApp {
                     .zip(translated)
                     .map(|(l, t)| selinga_pipeline::LinePair {
                         source: l.text.clone(),
-                        translated: t,
+                        translated: selinga_pipeline::normalize_translation(&t),
                         rect: l.rect,
                     })
                     .collect(),
             };
-            // A config change or timeout bumps the generation; anything this
-            // worker computed under the old generation must not poison the cache.
             if gen_shared.load(Ordering::SeqCst) == generation
                 && let Ok(mut c) = cache.lock()
             {
                 *c = Some(FrameCache {
                     hash,
                     output: output.clone(),
+                    ai,
                 });
             }
             send(
                 &tx,
                 WorkerMsg::Done {
                     epoch: generation,
+                    ai,
                     output,
                     translate_error,
                 },
             );
         });
+    }
+
+    #[cfg(not(windows))]
+    fn trigger_ai(&mut self, _ctx: &egui::Context) {
+        self.notice = Some("AI 识图 + 翻译仅在 Windows 可用".to_owned());
     }
 
     #[cfg(not(windows))]
@@ -1317,15 +1548,6 @@ impl SelingaApp {
                         tray.set_paused_label(self.paused);
                     }
                 }
-                TrayCommand::ToggleAi => {
-                    self.vlm.enabled = !self.vlm.enabled;
-                    self.persist_settings();
-                    self.rebuild_translator();
-                    if let Some(tray) = &self.tray {
-                        tray.set_ai_label(self.vlm.enabled);
-                    }
-                    self.refresh_now(ctx);
-                }
                 TrayCommand::Refresh => {
                     if !self.busy
                         && let Some(rect) = self.last_rect
@@ -1335,6 +1557,10 @@ impl SelingaApp {
                     }
                 }
                 TrayCommand::Reselect => self.enter_select_mode(ctx),
+                TrayCommand::OpenConfig => {
+                    log_event("tray: OpenConfig");
+                    self.open_settings_file();
+                }
                 TrayCommand::Quit => std::process::exit(0),
             }
         }
@@ -1351,7 +1577,9 @@ impl SelingaApp {
         self.last_trigger = None;
         self.result = None;
         self.translate_error = None;
-        self.busy = false;
+        self.notice = None;
+        self.result_ai = false;
+        self.bump_generation();
         #[cfg(windows)]
         {
             self.select_bg = None;
@@ -1374,11 +1602,20 @@ impl SelingaApp {
     }
 
     #[cfg(windows)]
-    fn drain_tray_quit_only(&mut self) {
-        if let Some(tray) = &self.tray
-            && tray.drain().contains(&TrayCommand::Quit)
-        {
-            std::process::exit(0);
+    fn drain_tray_select_phase(&mut self) {
+        let commands = match &self.tray {
+            Some(tray) => tray.drain(),
+            None => return,
+        };
+        for cmd in commands {
+            match cmd {
+                TrayCommand::OpenConfig => {
+                    log_event("tray: OpenConfig");
+                    self.open_settings_file();
+                }
+                TrayCommand::Quit => std::process::exit(0),
+                _ => {}
+            }
         }
     }
 
@@ -1393,21 +1630,26 @@ impl SelingaApp {
         let current = self.generation();
         let mut done = false;
         while let Ok(msg) = worker.rx.try_recv() {
-            let (epoch, outcome) = match msg {
+            let (epoch, ai, outcome) = match msg {
                 WorkerMsg::Done {
                     epoch,
+                    ai,
                     output,
                     translate_error,
-                } => (epoch, Ok((output, translate_error))),
-                WorkerMsg::Failed { epoch, message } => (epoch, Err(message)),
+                } => (epoch, ai, Ok((output, translate_error))),
+                WorkerMsg::Failed { epoch, ai, message } => (epoch, ai, Err(message)),
             };
             if epoch != current {
                 continue;
+            }
+            if ai {
+                self.pending_ai = false;
             }
             match outcome {
                 Ok((output, translate_error)) => {
                     self.result = Some(Ok(output));
                     self.translate_error = translate_error;
+                    self.result_ai = ai;
                 }
                 Err(message) => {
                     self.result = Some(Err(message));
@@ -1432,51 +1674,203 @@ fn send(tx: &std::sync::mpsc::Sender<WorkerMsg>, msg: WorkerMsg) {
     let _ = tx.send(msg);
 }
 
-/// Run recognition through the configured engine. VLM first when enabled,
-/// falling back to the local Windows engine on any failure so the overlay
-/// never goes blank.
 #[cfg(windows)]
-fn recognize_lines(
-    frame: &selinga_capture::Frame,
-    vlm: Option<&selinga_ocr::vlm::VlmEndpoint>,
-) -> Result<Vec<selinga_ocr::OcrLine>, String> {
-    if let Some(endpoint) = vlm {
-        match selinga_ocr::vlm::VlmOcr::new(endpoint.clone()).recognize(frame) {
-            Ok(lines) => return Ok(synthesize_layout(lines, frame)),
-            Err(e) => eprintln!("selinga: vlm ocr failed, falling back: {e}"),
-        }
-    }
+fn recognize_local(frame: &selinga_capture::Frame) -> Result<Vec<selinga_ocr::OcrLine>, String> {
     let ocr = selinga_ocr::win32::WinOcr::new(None).map_err(|e| format!("ocr engine: {e}"))?;
     ocr.recognize(frame).map_err(|e| format!("ocr: {e}"))
 }
 
-/// VLM replies carry no geometry; give those lines even rows spanning the
-/// crop so the overlay has something to anchor to.
 #[cfg(windows)]
-fn synthesize_layout(
-    lines: Vec<selinga_ocr::OcrLine>,
+const AI_TARGET_LINE_PX: f32 = 20.0;
+
+#[cfg(windows)]
+fn ai_pass(
     frame: &selinga_capture::Frame,
-) -> Vec<selinga_ocr::OcrLine> {
-    if lines.is_empty() || !lines.iter().any(|l| l.rect.is_none()) {
-        return lines;
+    config: &selinga_translate::vlm::VlmConfig,
+    target: &str,
+) -> Result<(Vec<selinga_ocr::OcrLine>, Vec<String>), String> {
+    let endpoint = selinga_ocr::vlm::VlmEndpoint {
+        base_url: config.base_url.clone(),
+        api_key: config.api_key.clone(),
+        model: config.model.clone(),
+    };
+    let local = recognize_local(frame).unwrap_or_default();
+    let scale = ai_scale_factor(median_line_height(&local), frame.width, frame.height);
+    let enlarged = (scale > 1).then(|| frame.upscaled(scale));
+    let input = enlarged.as_ref().unwrap_or(frame);
+
+    let merged = selinga_ocr::vlm::VlmOcr::new(endpoint)
+        .recognize_and_translate(input, target, local.len())
+        .map_err(|e| format!("AI 识图: {e}"))?;
+    if merged.is_empty() {
+        return translate_local(&local, config, target);
     }
-    let n = lines.len();
-    let row_h = frame.height as f32 / n as f32;
-    lines
-        .into_iter()
-        .enumerate()
-        .map(|(i, mut line)| {
-            if line.rect.is_none() {
-                line.rect = Some(selinga_ocr::Rect {
-                    x: 0.0,
-                    y: row_h * i as f32,
-                    w: frame.width as f32,
-                    h: row_h,
-                });
+    let sources: Vec<String> = merged.iter().map(|line| line.text.clone()).collect();
+    let mut translations: Vec<Option<String>> =
+        merged.iter().map(|line| line.translated.clone()).collect();
+    if translations.iter().any(Option::is_none) {
+        let vlm = selinga_translate::vlm::VlmTranslator::new(config.clone(), target);
+        match vlm.translate_lines(&sources) {
+            Ok(filled) if filled.len() == sources.len() => {
+                translations = filled.into_iter().map(Some).collect();
             }
-            line
+            Ok(_) => {}
+            Err(e) => return Err(format!("AI 翻译: {e}")),
+        }
+    }
+    let lines: Vec<selinga_ocr::OcrLine> = merged
+        .into_iter()
+        .map(|line| selinga_ocr::OcrLine {
+            text: line.text,
+            rect: line.rect,
+            words: Vec::new(),
         })
-        .collect()
+        .collect();
+    let lines = merge_layout(lines, &local, frame.width as f32, frame.height as f32);
+    let translated: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            translations
+                .get(index)
+                .and_then(|t| t.clone())
+                .unwrap_or_else(|| line.text.clone())
+        })
+        .collect();
+    Ok((lines, translated))
+}
+
+#[cfg(windows)]
+fn translate_local(
+    local: &[selinga_ocr::OcrLine],
+    config: &selinga_translate::vlm::VlmConfig,
+    target: &str,
+) -> Result<(Vec<selinga_ocr::OcrLine>, Vec<String>), String> {
+    if local.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let sources: Vec<String> = local.iter().map(|line| line.text.clone()).collect();
+    let vlm = selinga_translate::vlm::VlmTranslator::new(config.clone(), target);
+    let translated = vlm
+        .translate_lines(&sources)
+        .map_err(|e| format!("AI 翻译: {e}"))?;
+    Ok((local.to_vec(), translated))
+}
+
+#[cfg(windows)]
+fn median_line_height(lines: &[selinga_ocr::OcrLine]) -> Option<f32> {
+    let mut heights: Vec<f32> = lines
+        .iter()
+        .filter_map(|line| line.rect)
+        .map(|rect| rect.h)
+        .filter(|h| *h > 0.5)
+        .collect();
+    if heights.is_empty() {
+        return None;
+    }
+    heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(heights[heights.len() / 2])
+}
+
+#[cfg(windows)]
+fn ai_scale_factor(median_line_px: Option<f32>, width: u32, height: u32) -> u32 {
+    let longest = width.max(height).max(1);
+    let limit = (selinga_ocr::vlm::MAX_SIDE / longest).max(1);
+    let wanted = match median_line_px {
+        Some(h) if h > 0.5 => (AI_TARGET_LINE_PX / h).ceil().clamp(1.0, 3.0) as u32,
+        _ => {
+            if longest < 600 {
+                2
+            } else {
+                1
+            }
+        }
+    };
+    wanted.min(limit).max(1)
+}
+
+#[cfg(windows)]
+fn merge_layout(
+    vlm: Vec<selinga_ocr::OcrLine>,
+    local: &[selinga_ocr::OcrLine],
+    width: f32,
+    height: f32,
+) -> Vec<selinga_ocr::OcrLine> {
+    let count = vlm.len();
+    let boxes: Vec<selinga_ocr::Rect> = local.iter().filter_map(|line| line.rect).collect();
+    let region = union_of(&boxes).unwrap_or(selinga_ocr::Rect {
+        x: 0.0,
+        y: 0.0,
+        w: width,
+        h: height,
+    });
+    let even = boxes.len() == count;
+    let tolerance = region.h / count.max(1) as f32;
+    let mut used = vec![false; boxes.len()];
+    let mut out = Vec::with_capacity(count);
+    for (index, mut line) in vlm.into_iter().enumerate() {
+        if line.rect.is_none() {
+            let borrowed = if even {
+                Some(boxes[index])
+            } else {
+                match nearest_unused(&boxes, &used, region, index, count) {
+                    Some((slot, distance)) if distance <= tolerance => {
+                        used[slot] = true;
+                        Some(boxes[slot])
+                    }
+                    _ => None,
+                }
+            };
+            line.rect = Some(borrowed.unwrap_or_else(|| row_rect(region, index, count)));
+        }
+        out.push(line);
+    }
+    out
+}
+
+#[cfg(windows)]
+fn union_of(rects: &[selinga_ocr::Rect]) -> Option<selinga_ocr::Rect> {
+    let first = *rects.first()?;
+    Some(rects[1..].iter().fold(first, |acc, r| {
+        let x0 = acc.x.min(r.x);
+        let y0 = acc.y.min(r.y);
+        let x1 = (acc.x + acc.w).max(r.x + r.w);
+        let y1 = (acc.y + acc.h).max(r.y + r.h);
+        selinga_ocr::Rect {
+            x: x0,
+            y: y0,
+            w: x1 - x0,
+            h: y1 - y0,
+        }
+    }))
+}
+
+#[cfg(windows)]
+fn nearest_unused(
+    boxes: &[selinga_ocr::Rect],
+    used: &[bool],
+    region: selinga_ocr::Rect,
+    index: usize,
+    count: usize,
+) -> Option<(usize, f32)> {
+    let expected = region.y + region.h * (index as f32 + 0.5) / count.max(1) as f32;
+    boxes
+        .iter()
+        .enumerate()
+        .filter(|(slot, _)| !used[*slot])
+        .map(|(slot, rect)| (slot, (rect.y + rect.h / 2.0 - expected).abs()))
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+#[cfg(windows)]
+fn row_rect(region: selinga_ocr::Rect, index: usize, count: usize) -> selinga_ocr::Rect {
+    let row_h = region.h / count.max(1) as f32;
+    selinga_ocr::Rect {
+        x: region.x,
+        y: region.y + row_h * index as f32,
+        w: region.w,
+        h: row_h,
+    }
 }
 
 #[cfg(windows)]
@@ -1556,8 +1950,14 @@ fn resize_direction(rect: egui::Rect, pos: Option<egui::Pos2>) -> Option<egui::R
     }
 }
 
-/// Apply a pointer delta to the grabbed edge(s) of `start`, clamping so the
-/// box never shrinks below `MIN_SELECT` on either axis.
+fn clamp_rect(rect: egui::Rect, screen_w: f32, screen_h: f32) -> egui::Rect {
+    let width = rect.width().min(screen_w);
+    let height = rect.height().min(screen_h);
+    let x = rect.min.x.clamp(0.0, (screen_w - width).max(0.0));
+    let y = rect.min.y.clamp(0.0, (screen_h - height).max(0.0));
+    egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(width, height))
+}
+
 fn resize_rect(start: egui::Rect, delta: egui::Vec2, dir: egui::ResizeDirection) -> egui::Rect {
     let mut r = start;
     let west = (start.left() + delta.x).min(start.right() - MIN_SELECT);
@@ -1624,9 +2024,6 @@ struct TriggerInput {
     since_trigger: Option<Duration>,
 }
 
-// Two-channel trigger: (A) geometry settled for DEBOUNCE, (B) a static box
-// polling every POLL_INTERVAL so scrolled content still refreshes. Dragging,
-// a busy worker, pause and hide all suppress both.
 fn trigger_decision(input: TriggerInput) -> Option<TriggerKind> {
     if !input.pointer_idle
         || input.paused
@@ -1743,5 +2140,128 @@ mod tests {
     #[test]
     fn never_triggered_box_stays_idle() {
         assert_eq!(trigger_decision(idle()), None);
+    }
+
+    #[test]
+    fn clamp_keeps_the_box_on_screen() {
+        let clamped = clamp_rect(
+            egui::Rect::from_min_size(egui::pos2(-50.0, -20.0), egui::vec2(200.0, 100.0)),
+            1000.0,
+            800.0,
+        );
+        assert_eq!(clamped.min.x, 0.0);
+        assert_eq!(clamped.min.y, 0.0);
+
+        let clamped = clamp_rect(
+            egui::Rect::from_min_size(egui::pos2(950.0, 780.0), egui::vec2(200.0, 100.0)),
+            1000.0,
+            800.0,
+        );
+        assert_eq!(clamped.max.x, 1000.0);
+        assert_eq!(clamped.max.y, 800.0);
+    }
+
+    #[test]
+    fn clamp_shrinks_oversized_boxes() {
+        let clamped = clamp_rect(
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1200.0, 900.0)),
+            1000.0,
+            800.0,
+        );
+        assert_eq!(clamped.width(), 1000.0);
+        assert_eq!(clamped.height(), 800.0);
+    }
+
+    #[test]
+    fn display_mode_strings_map_to_modes() {
+        assert_eq!(display_mode_from("bilingual"), DisplayMode::Bilingual);
+        assert_eq!(display_mode_from("translation"), DisplayMode::Translation);
+        assert_eq!(display_mode_from("side-by-side"), DisplayMode::Translation);
+    }
+
+    #[cfg(windows)]
+    mod ai_layout {
+        use super::*;
+
+        fn line(text: &str, rect: Option<selinga_ocr::Rect>) -> selinga_ocr::OcrLine {
+            selinga_ocr::OcrLine {
+                text: text.to_owned(),
+                rect,
+                words: Vec::new(),
+            }
+        }
+
+        fn boxed(x: f32, y: f32, w: f32, h: f32) -> Option<selinga_ocr::Rect> {
+            Some(selinga_ocr::Rect { x, y, w, h })
+        }
+
+        #[test]
+        fn model_boxes_are_kept() {
+            let vlm = vec![line("a", boxed(5.0, 5.0, 50.0, 12.0))];
+            let local = vec![line("x", boxed(0.0, 0.0, 300.0, 100.0))];
+            let merged = merge_layout(vlm, &local, 300.0, 200.0);
+            assert_eq!(merged[0].rect.unwrap().w, 50.0);
+        }
+
+        #[test]
+        fn text_only_reply_borrows_local_geometry() {
+            let vlm = vec![line("a", None), line("b", None)];
+            let local = vec![
+                line("x", boxed(10.0, 10.0, 100.0, 20.0)),
+                line("y", boxed(10.0, 40.0, 90.0, 18.0)),
+            ];
+            let merged = merge_layout(vlm, &local, 300.0, 200.0);
+            assert_eq!(merged[0].rect.unwrap().h, 20.0);
+            assert_eq!(merged[1].rect.unwrap().y, 40.0);
+            assert_eq!(merged[1].rect.unwrap().w, 90.0);
+        }
+
+        #[test]
+        fn mismatched_counts_still_get_ordered_rects() {
+            let vlm = vec![line("a", None), line("b", None), line("c", None)];
+            let local = vec![line("x", boxed(0.0, 0.0, 100.0, 20.0))];
+            let merged = merge_layout(vlm, &local, 400.0, 300.0);
+            let rects: Vec<_> = merged.iter().filter_map(|l| l.rect).collect();
+            assert_eq!(rects.len(), 3);
+            assert!(rects.windows(2).all(|pair| pair[0].y <= pair[1].y));
+        }
+
+        #[test]
+        fn without_local_text_rows_span_the_crop() {
+            let vlm = vec![line("a", None), line("b", None)];
+            let merged = merge_layout(vlm, &[], 640.0, 400.0);
+            assert_eq!(merged[0].rect.unwrap().w, 640.0);
+            assert_eq!(merged[0].rect.unwrap().h, 200.0);
+            assert_eq!(merged[1].rect.unwrap().y, 200.0);
+        }
+
+        #[test]
+        fn small_glyphs_are_enlarged() {
+            assert_eq!(ai_scale_factor(Some(20.0), 400, 200), 1);
+            assert_eq!(ai_scale_factor(Some(10.0), 400, 200), 2);
+            assert_eq!(ai_scale_factor(Some(5.0), 400, 200), 3);
+        }
+
+        #[test]
+        fn enlargement_stays_under_the_model_ceiling() {
+            assert_eq!(ai_scale_factor(Some(5.0), 2000, 400), 1);
+            assert_eq!(ai_scale_factor(Some(5.0), 700, 300), 2);
+        }
+
+        #[test]
+        fn unknown_text_size_uses_crop_size_as_the_hint() {
+            assert_eq!(ai_scale_factor(None, 300, 200), 2);
+            assert_eq!(ai_scale_factor(None, 900, 400), 1);
+        }
+
+        #[test]
+        fn median_height_ignores_lines_without_boxes() {
+            let lines = vec![
+                line("a", None),
+                line("b", boxed(0.0, 0.0, 10.0, 14.0)),
+                line("c", boxed(0.0, 0.0, 10.0, 24.0)),
+            ];
+            assert_eq!(median_line_height(&lines), Some(24.0));
+        }
     }
 }

@@ -10,6 +10,7 @@ const ENHANCE_CONTRAST: f32 = 1.3;
 const PAD_PX: u32 = 16;
 const DARK_MEAN_THRESHOLD: f32 = 100.0;
 const RETRY_MIN_WEIGHT: usize = 6;
+const TINY_LINE_PX: f32 = 12.0;
 const RADICAL_FRAGMENTS: &[char] = &[
     '彳', '亍', '氵', '讠', '钅', '忄', '丬', '宀', '屮', '彡', '冫', '厶', '丿', '丨', '丶', '亠',
     '冂', '匚', '卩', '刂', '阝', '廴', '犭', '彐', '乛', '丷',
@@ -39,38 +40,6 @@ struct Prepared {
     frame: Frame,
     scale: f32,
     pad: f32,
-}
-
-// Nearest-neighbour upscale. Previous revision allocated one small Vec per
-// source pixel; this writes straight into a reused row buffer instead.
-fn upscale(frame: &Frame, factor: u32) -> Frame {
-    let (w, h) = (frame.width, frame.height);
-    let (nw, nh) = (w * factor, h * factor);
-    let mut bgra = Vec::with_capacity((nw * nh * 4) as usize);
-    if w == 0 || h == 0 {
-        return Frame {
-            width: nw,
-            height: nh,
-            bgra,
-        };
-    }
-    let mut line = Vec::with_capacity((nw * 4) as usize);
-    for row in frame.bgra.chunks_exact((w * 4) as usize) {
-        line.clear();
-        for px in row.chunks_exact(4) {
-            for _ in 0..factor {
-                line.extend_from_slice(px);
-            }
-        }
-        for _ in 0..factor {
-            bgra.extend_from_slice(&line);
-        }
-    }
-    Frame {
-        width: nw,
-        height: nh,
-        bgra,
-    }
 }
 
 fn mean_luma(frame: &Frame) -> f32 {
@@ -251,7 +220,7 @@ fn prepare(
             return None;
         }
     }
-    let mut out = upscale(frame, factor);
+    let mut out = frame.upscaled(factor);
     match tone {
         Tone::Contrast => {
             match polarity {
@@ -338,6 +307,20 @@ fn fragment_count(lines: &[OcrLine]) -> usize {
 
 fn score(lines: &[OcrLine]) -> usize {
     result_weight(lines).saturating_sub(FRAGMENT_PENALTY * fragment_count(lines))
+}
+
+fn median_line_height(lines: &[OcrLine]) -> f32 {
+    let heights: Vec<f32> = lines
+        .iter()
+        .filter_map(|line| line.rect)
+        .map(|rect| rect.h)
+        .filter(|h| *h > 0.5)
+        .collect();
+    if heights.is_empty() {
+        f32::MAX
+    } else {
+        median_f32(heights)
+    }
 }
 
 fn median_f32(mut values: Vec<f32>) -> f32 {
@@ -692,6 +675,15 @@ impl Ocr for WinOcr {
             }
         }
 
+        if best
+            .as_ref()
+            .is_some_and(|lines| median_line_height(lines) < TINY_LINE_PX)
+            && let Some(prep) = prepare(frame, 6, Tone::Contrast, Polarity::Auto, max)
+            && let Ok(lines) = self.run_variant(&prep)
+        {
+            consider(lines, &mut best, &mut best_score);
+        }
+
         match (best, first_err) {
             (Some(lines), _) => Ok(lines),
             (None, Some(err)) => Err(err),
@@ -723,64 +715,6 @@ mod tests {
         assert_eq!(result_weight(&lines), 4);
     }
 
-    fn upscale_reference(frame: &Frame, factor: u32) -> Frame {
-        let (w, h) = (frame.width, frame.height);
-        let (nw, nh) = (w * factor, h * factor);
-        let mut bgra = Vec::with_capacity((nw * nh * 4) as usize);
-        for sy in 0..h {
-            let row = &frame.bgra[(sy * w * 4) as usize..((sy + 1) * w * 4) as usize];
-            let mut line = Vec::with_capacity((nw * 4) as usize);
-            for px in row.chunks_exact(4) {
-                let pixel: Vec<u8> = px
-                    .iter()
-                    .cycle()
-                    .take(factor as usize * 4)
-                    .copied()
-                    .collect();
-                line.extend_from_slice(&pixel);
-            }
-            for _ in 0..factor {
-                bgra.extend_from_slice(&line);
-            }
-        }
-        Frame {
-            width: nw,
-            height: nh,
-            bgra,
-        }
-    }
-
-    #[test]
-    fn upscale_matches_reference_for_all_factors() {
-        let (w, h) = (7u32, 5u32);
-        let mut bgra = Vec::with_capacity((w * h * 4) as usize);
-        for i in 0..(w * h) {
-            bgra.extend_from_slice(&[(i % 251) as u8, (i % 7) as u8, (i * 3 % 253) as u8, 255]);
-        }
-        let frame = Frame {
-            width: w,
-            height: h,
-            bgra,
-        };
-        for factor in [1u32, 2, 3, 4] {
-            let fast = upscale(&frame, factor);
-            let reference = upscale_reference(&frame, factor);
-            assert_eq!(fast.width, reference.width);
-            assert_eq!(fast.height, reference.height);
-            assert_eq!(fast.bgra, reference.bgra, "factor {factor} differs");
-        }
-    }
-
-    #[test]
-    fn upscale_handles_empty_frame() {
-        let frame = Frame {
-            width: 0,
-            height: 0,
-            bgra: Vec::new(),
-        };
-        let out = upscale(&frame, 2);
-        assert!(out.bgra.is_empty());
-    }
     fn word(text: &str, x: f32, y: f32, w: f32, h: f32) -> OcrWord {
         OcrWord {
             text: text.to_owned(),

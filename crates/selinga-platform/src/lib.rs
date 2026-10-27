@@ -1,3 +1,17 @@
+#[cfg(windows)]
+fn hide_from_taskbar(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
+    use windows::Win32::UI::Shell::{ITaskbarList, TaskbarList};
+
+    unsafe {
+        let Ok(list) = CoCreateInstance::<_, ITaskbarList>(&TaskbarList, None, CLSCTX_ALL) else {
+            return;
+        };
+        let _ = list.HrInit();
+        let _ = list.DeleteTab(hwnd);
+    }
+}
+
 pub fn exclude_self_from_capture() -> usize {
     #[cfg(windows)]
     {
@@ -13,6 +27,7 @@ pub fn exclude_self_from_capture() -> usize {
                 GetWindowThreadProcessId(hwnd, Some(&mut pid));
                 if pid == GetCurrentProcessId() {
                     let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+                    hide_from_taskbar(hwnd);
                     let counter = lparam.0 as *mut usize;
                     *counter += 1;
                 }
@@ -34,11 +49,6 @@ pub fn exclude_self_from_capture() -> usize {
     }
 }
 
-/// Synchronously move/resize a top-level window found by title, in physical
-/// pixels. Applying the geometry directly (instead of deferring to the native
-/// modal drag loop) lets the caller repaint at the target geometry in the same
-/// frame, so borders never trail behind the cursor. Returns false when the
-/// window was not found or on non-Windows.
 pub fn set_window_geometry_px(title: &str, x: i32, y: i32, w: i32, h: i32) -> bool {
     #[cfg(windows)]
     unsafe {
@@ -48,7 +58,10 @@ pub fn set_window_geometry_px(title: &str, x: i32, y: i32, w: i32, h: i32) -> bo
         };
         let mut wide: Vec<u16> = title.encode_utf16().collect();
         wide.push(0);
-        let Ok(hwnd) = FindWindowW(windows::core::PCWSTR(wide.as_ptr()), None) else {
+        let Ok(hwnd) = FindWindowW(
+            windows::core::PCWSTR::null(),
+            windows::core::PCWSTR(wide.as_ptr()),
+        ) else {
             return false;
         };
         if hwnd == HWND::default() {
@@ -56,7 +69,7 @@ pub fn set_window_geometry_px(title: &str, x: i32, y: i32, w: i32, h: i32) -> bo
         }
         SetWindowPos(
             hwnd,
-            Some(HWND::default()), // ignored with SWP_NOZORDER
+            Some(HWND::default()),
             x,
             y,
             w.max(1),
@@ -70,6 +83,114 @@ pub fn set_window_geometry_px(title: &str, x: i32, y: i32, w: i32, h: i32) -> bo
     {
         let _ = (title, x, y, w, h);
         false
+    }
+}
+
+pub fn open_in_editor(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        match shell_open(path) {
+            Ok(()) => Ok(()),
+            Err(shell_error) => {
+                if let Some(editor) = std::env::var_os("SELINGA_EDITOR").filter(|v| !v.is_empty()) {
+                    return spawn(&editor, path).map_err(|e| format!("{shell_error}; {e}"));
+                }
+                spawn(std::ffi::OsStr::new("notepad.exe"), path)
+                    .map_err(|e| format!("{shell_error}; notepad fallback: {e}"))
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err("open_in_editor is Windows-only".to_owned())
+    }
+}
+
+#[cfg(windows)]
+fn shell_open(path: &std::path::Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::PCWSTR;
+
+    let file: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let operation: Vec<u16> = "open\0".encode_utf16().collect();
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(operation.as_ptr()),
+            PCWSTR(file.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    let code = result.0 as isize;
+    if code > 32 {
+        Ok(())
+    } else {
+        Err(format!("ShellExecuteW returned {code}"))
+    }
+}
+
+#[cfg(windows)]
+fn spawn(program: &std::ffi::OsStr, path: &std::path::Path) -> Result<(), String> {
+    std::process::Command::new(program)
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_child| ())
+        .map_err(|e| format!("cannot start {}: {e}", program.to_string_lossy()))
+}
+
+pub fn single_instance() -> bool {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
+        use windows::Win32::System::Threading::CreateMutexW;
+        use windows::core::PCWSTR;
+
+        let name: Vec<u16> = "Local\\selinga-single-instance\0".encode_utf16().collect();
+        let Ok(handle) = CreateMutexW(None, true, PCWSTR(name.as_ptr())) else {
+            return true;
+        };
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            let _ = CloseHandle(handle);
+            activate_existing();
+            return false;
+        }
+        let _ = handle;
+        true
+    }
+
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+#[cfg(windows)]
+fn activate_existing() {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, SW_RESTORE, SetForegroundWindow, ShowWindow,
+    };
+    use windows::core::PCWSTR;
+
+    for title in ["Selinga Box", "Selinga"] {
+        let wide: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+        if let Ok(hwnd) = unsafe { FindWindowW(PCWSTR::null(), PCWSTR(wide.as_ptr())) }
+            && !hwnd.is_invalid()
+        {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+                let _ = SetForegroundWindow(hwnd);
+            }
+            return;
+        }
     }
 }
 

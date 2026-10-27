@@ -13,19 +13,27 @@ pub struct VlmConfig {
 
 pub struct VlmTranslator {
     cfg: VlmConfig,
+    target: String,
     agent: ureq::Agent,
 }
 
-const SYSTEM_PROMPT: &str = "You are a translation engine. Translate each input line \
-into the target language. Reply with exactly the same number of lines as the input, \
-one translated line per input line, no numbering, no explanations, no extra blank lines.";
+fn token_budget(lines: usize) -> u32 {
+    (64 + 36 * lines as u32).clamp(256, 4096)
+}
+
+const SYSTEM_PROMPT: &str = r#"You are a translation engine. Translate every source line into @TARGET@. Reply with exactly the same number of lines as the input, in the same order: no numbering, no quotes, no explanations, no blank lines. Leave a line unchanged if it is already @TARGET@ or has nothing to translate (numbers, code, URLs)."#;
 
 impl VlmTranslator {
-    pub fn new(cfg: VlmConfig) -> Self {
+    pub fn new(cfg: VlmConfig, target: &str) -> Self {
         Self {
             cfg,
+            target: target.to_owned(),
             agent: http_agent(TIMEOUT),
         }
+    }
+
+    fn system_prompt(&self) -> String {
+        SYSTEM_PROMPT.replace("@TARGET@", &self.target)
     }
 }
 
@@ -49,12 +57,19 @@ impl Translator for VlmTranslator {
         if let Some(key) = &self.cfg.api_key {
             req = req.set("Authorization", &format!("Bearer {key}"));
         }
+        let user = format!(
+            "Lines: {}\nTarget language: {}\n---\n{}",
+            lines.len(),
+            self.target,
+            lines.join("\n")
+        );
         let body = serde_json::json!({
             "model": self.cfg.model,
             "temperature": 0,
+            "max_tokens": token_budget(lines.len()),
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": lines.join("\n")},
+                {"role": "system", "content": self.system_prompt()},
+                {"role": "user", "content": user},
             ]
         });
         let resp = req
@@ -84,9 +99,6 @@ fn strip_code_fence(content: &str) -> &str {
     rest.trim_end().strip_suffix("```").unwrap_or(rest).trim()
 }
 
-// Models do not reliably honour the line count. Rather than failing the whole
-// backend (and paying for the request anyway), align the reply with the inputs:
-// drop trailing blank/extra lines, pad missing ones with the untranslated text.
 fn split_reply(content: &str, inputs: &[String]) -> Vec<String> {
     let mut out: Vec<String> = content
         .split('\n')
@@ -105,6 +117,31 @@ fn split_reply(content: &str, inputs: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn translator(target: &str) -> VlmTranslator {
+        VlmTranslator::new(
+            VlmConfig {
+                base_url: "http://localhost:1/v1".to_owned(),
+                api_key: None,
+                model: "test-model".to_owned(),
+            },
+            target,
+        )
+    }
+
+    #[test]
+    fn token_budget_scales_with_the_batch() {
+        assert!(token_budget(1) < token_budget(20));
+        assert_eq!(token_budget(0), 256);
+        assert_eq!(token_budget(10_000), 4096);
+    }
+
+    #[test]
+    fn system_prompt_names_the_target_language() {
+        let prompt = translator("ja-JP").system_prompt();
+        assert!(prompt.contains("ja-JP"));
+        assert!(!prompt.contains("@TARGET@"));
+    }
 
     #[test]
     fn strips_markdown_fence() {

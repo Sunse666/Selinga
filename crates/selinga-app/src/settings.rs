@@ -8,6 +8,25 @@ pub struct Settings {
     pub paused: bool,
     #[serde(default = "VlmSettings::disabled")]
     pub vlm: VlmSettings,
+    #[serde(default)]
+    pub hotkeys: HotkeySettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HotkeySettings {
+    pub hide: String,
+    pub pause: String,
+    pub reselect: String,
+}
+
+impl Default for HotkeySettings {
+    fn default() -> Self {
+        Self {
+            hide: "Ctrl+Alt+H".to_owned(),
+            pause: "Ctrl+Alt+P".to_owned(),
+            reselect: "F2".to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,15 +71,26 @@ impl Default for Settings {
             display_mode: KNOWN_DISPLAY_MODES[0].to_owned(),
             paused: false,
             vlm: VlmSettings::disabled(),
+            hotkeys: HotkeySettings::default(),
         }
     }
 }
 
 impl Settings {
-    pub fn load() -> Self {
-        Self::path()
-            .and_then(|p| Self::load_from(&p))
-            .unwrap_or_default()
+    pub fn load_or_recover() -> (Self, Option<PathBuf>) {
+        match Self::path() {
+            Some(path) => Self::recover_from(&path),
+            None => (Self::default(), None),
+        }
+    }
+
+    fn recover_from(path: &std::path::Path) -> (Self, Option<PathBuf>) {
+        if let Some(settings) = Self::load_from(path) {
+            return (settings, None);
+        }
+        let backup = path.with_extension("toml.broken");
+        let moved = std::fs::rename(path, &backup).is_ok();
+        (Self::default(), moved.then_some(backup))
     }
 
     pub fn save(&self) {
@@ -69,7 +99,7 @@ impl Settings {
         }
     }
 
-    fn path() -> Option<PathBuf> {
+    pub fn path() -> Option<PathBuf> {
         #[cfg(windows)]
         let base = std::env::var_os("APPDATA").map(PathBuf::from);
         #[cfg(not(windows))]
@@ -77,10 +107,7 @@ impl Settings {
         base.map(|b| b.join("selinga").join("settings.toml"))
     }
 
-    // A single bad field used to discard the whole file and silently fall back
-    // to defaults; recover field by field instead so the rest of the config
-    // (paused state, [vlm] section) survives a bad value.
-    fn load_from(path: &std::path::Path) -> Option<Self> {
+    pub fn load_from(path: &std::path::Path) -> Option<Self> {
         let text = std::fs::read_to_string(path).ok()?;
         let mut settings: Settings = toml::from_str(&text).ok()?;
         if !KNOWN_LANGS.contains(&settings.target_lang.as_str()) {
@@ -92,8 +119,6 @@ impl Settings {
         Some(settings)
     }
 
-    // Write to a sibling temp file and rename, so a crash mid-write cannot
-    // leave a truncated settings.toml behind.
     fn save_to(&self, path: &std::path::Path) {
         let Ok(text) = toml::to_string_pretty(self) else {
             return;
@@ -127,10 +152,35 @@ mod tests {
             display_mode: "bilingual".to_owned(),
             paused: true,
             vlm: VlmSettings::disabled(),
+            hotkeys: HotkeySettings {
+                hide: "Ctrl+Shift+H".to_owned(),
+                pause: "Ctrl+Shift+P".to_owned(),
+                reselect: "F4".to_owned(),
+            },
         };
         s.save_to(&path);
         assert_eq!(Settings::load_from(&path), Some(s));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unreadable_file_is_moved_aside() {
+        let path = temp_path("recover");
+        std::fs::write(&path, "not [ valid toml {{{{").unwrap();
+        let (settings, backup) = Settings::recover_from(&path);
+        assert_eq!(settings, Settings::default());
+        let backup = backup.expect("broken file should be backed up");
+        assert!(backup.exists());
+        assert!(!path.exists());
+        let _ = std::fs::remove_file(&backup);
+    }
+
+    #[test]
+    fn missing_file_reports_no_backup() {
+        let path = temp_path("recover-missing");
+        let _ = std::fs::remove_file(&path);
+        let (_, backup) = Settings::recover_from(&path);
+        assert!(backup.is_none());
     }
 
     #[test]
@@ -232,10 +282,40 @@ mod tests {
     }
 
     #[test]
+    fn missing_hotkey_section_uses_defaults() {
+        let path = temp_path("hotkeys-missing");
+        std::fs::write(
+            &path,
+            "target_lang = \"zh-CN\"\ndisplay_mode = \"translation\"\npaused = false\n",
+        )
+        .unwrap();
+        let s = Settings::load_from(&path).unwrap();
+        assert_eq!(s.hotkeys.reselect, "F2");
+        assert_eq!(s.hotkeys.hide, "Ctrl+Alt+H");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn default_matches_first_toolbar_state() {
         let d = Settings::default();
         assert_eq!(d.target_lang, "zh-CN");
         assert_eq!(d.display_mode, "translation");
         assert!(!d.paused);
+    }
+
+    #[test]
+    fn serialized_file_exposes_ai_fields() {
+        let text = toml::to_string_pretty(&Settings::default()).unwrap();
+        for key in [
+            "[vlm]",
+            "enabled",
+            "base_url",
+            "api_key",
+            "model",
+            "[hotkeys]",
+            "reselect",
+        ] {
+            assert!(text.contains(key), "missing {key} in:\n{text}");
+        }
     }
 }
