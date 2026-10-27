@@ -12,6 +12,71 @@ fn hide_from_taskbar(hwnd: windows::Win32::Foundation::HWND) {
     }
 }
 
+#[cfg(windows)]
+fn hide_from_alt_tab(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GWLP_HWNDPARENT, GetClassNameW, GetWindowLongPtrW, SetWindowLongPtrW,
+        WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    };
+
+    unsafe {
+        let mut class = [0u16; 64];
+        let length = GetClassNameW(hwnd, &mut class);
+        if length <= 0 {
+            return;
+        }
+        let name = String::from_utf16_lossy(&class[..length as usize]).to_ascii_lowercase();
+        if !(name.contains("winit") || name == "window class") {
+            return;
+        }
+
+        let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let desired = (current & !WS_EX_APPWINDOW.0) | WS_EX_TOOLWINDOW.0;
+        if current != desired {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, desired as isize);
+        }
+        if let Some(owner) = alt_tab_owner() {
+            SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner.0 as isize);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn alt_tab_owner() -> Option<windows::Win32::Foundation::HWND> {
+    use std::sync::OnceLock;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE,
+    };
+    use windows::core::PCWSTR;
+
+    static OWNER: OnceLock<usize> = OnceLock::new();
+    let raw = *OWNER.get_or_init(|| unsafe {
+        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+        let title: Vec<u16> = "SelingaOwner\0".encode_utf16().collect();
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            PCWSTR(class.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            WINDOW_STYLE(0),
+            0,
+            0,
+            0,
+            0,
+            Some(HWND_MESSAGE),
+            None,
+            None,
+            None,
+        )
+        .map_or(0, |hwnd| hwnd.0 as usize)
+    });
+    if raw == 0 {
+        None
+    } else {
+        Some(HWND(raw as *mut core::ffi::c_void))
+    }
+}
+
 pub fn exclude_self_from_capture() -> usize {
     #[cfg(windows)]
     {
@@ -28,6 +93,7 @@ pub fn exclude_self_from_capture() -> usize {
                 if pid == GetCurrentProcessId() {
                     let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
                     hide_from_taskbar(hwnd);
+                    hide_from_alt_tab(hwnd);
                     let counter = lparam.0 as *mut usize;
                     *counter += 1;
                 }
@@ -191,6 +257,78 @@ fn activate_existing() {
             }
             return;
         }
+    }
+}
+
+pub fn set_autostart(enabled: bool) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+        use windows::Win32::System::Registry::{
+            HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ, RegCloseKey, RegDeleteValueW,
+            RegOpenKeyExW, RegSetValueExW,
+        };
+        use windows::core::PCWSTR;
+
+        const KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+        const VALUE: &str = "Selinga";
+
+        let payload = if enabled {
+            let exe = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
+            let command = format!("\"{}\"", exe.display());
+            Some(
+                command
+                    .encode_utf16()
+                    .chain(Some(0))
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<u8>>(),
+            )
+        } else {
+            None
+        };
+
+        let key_path: Vec<u16> = format!("{KEY}\0").encode_utf16().collect();
+        let value_name: Vec<u16> = format!("{VALUE}\0").encode_utf16().collect();
+        unsafe {
+            let mut key = HKEY::default();
+            let status = RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                PCWSTR(key_path.as_ptr()),
+                None,
+                KEY_SET_VALUE,
+                &mut key,
+            );
+            if status != ERROR_SUCCESS {
+                return Err(format!("cannot open Run key: {status:?}"));
+            }
+            let outcome = match &payload {
+                Some(data) => {
+                    let status =
+                        RegSetValueExW(key, PCWSTR(value_name.as_ptr()), None, REG_SZ, Some(data));
+                    if status == ERROR_SUCCESS {
+                        Ok(())
+                    } else {
+                        Err(format!("RegSetValueExW: {status:?}"))
+                    }
+                }
+                None => {
+                    let status = RegDeleteValueW(key, PCWSTR(value_name.as_ptr()));
+                    if status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND {
+                        Ok(())
+                    } else {
+                        Err(format!("RegDeleteValueW: {status:?}"))
+                    }
+                }
+            };
+            let _ = RegCloseKey(key);
+            outcome
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = enabled;
+        Err("autostart is Windows-only".to_owned())
     }
 }
 

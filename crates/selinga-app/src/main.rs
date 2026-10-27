@@ -22,7 +22,7 @@ use tray::{Tray, TrayCommand};
 
 const DEBOUNCE: Duration = Duration::from_millis(700);
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
-const EXCLUDE_INTERVAL: Duration = Duration::from_secs(1);
+const EXCLUDE_INTERVAL: Duration = Duration::from_millis(500);
 const HANDLE_MARGIN: f32 = 10.0;
 fn mask_color() -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(16, 16, 22, 230)
@@ -242,6 +242,7 @@ struct SelingaApp {
     translator: Arc<std::sync::RwLock<Arc<dyn Translator>>>,
     vlm: settings::VlmSettings,
     hotkeys: settings::HotkeySettings,
+    autostart: bool,
     hidden: bool,
     phase: Phase,
     sel_rect: Option<egui::Rect>,
@@ -346,6 +347,7 @@ impl SelingaApp {
             select_bg: None,
             vlm: saved.vlm.clone(),
             hotkeys: saved.hotkeys.clone(),
+            autostart: saved.autostart,
             translator: Arc::new(std::sync::RwLock::new(build_translator(
                 TARGET_LANGS[target_lang],
             ))),
@@ -372,6 +374,9 @@ impl SelingaApp {
             if let Some(err) = &tray_error {
                 log_event(&format!("tray unavailable: {err}"));
                 app.notice = Some(format!("托盘不可用：{err}"));
+            }
+            if let Err(err) = selinga_platform::set_autostart(app.autostart) {
+                log_event(&format!("autostart sync failed: {err}"));
             }
             if broken_settings.is_some() {
                 log_event("settings unreadable; original moved to settings.toml.broken");
@@ -407,6 +412,7 @@ impl SelingaApp {
             paused: false,
             vlm: self.vlm.clone(),
             hotkeys: self.hotkeys.clone(),
+            autostart: self.autostart,
         }
     }
 
@@ -492,13 +498,20 @@ impl SelingaApp {
 
     fn apply_settings(&mut self, loaded: Settings, ctx: &egui::Context) {
         let hotkeys_changed = loaded.hotkeys != self.hotkeys;
+        let autostart_changed = loaded.autostart != self.autostart;
         if let Some(index) = TARGET_LANGS.iter().position(|l| *l == loaded.target_lang) {
             self.target_lang = index;
         }
         self.display_mode = display_mode_from(&loaded.display_mode);
         self.vlm = loaded.vlm;
         self.hotkeys = loaded.hotkeys;
+        self.autostart = loaded.autostart;
         self.rebuild_translator();
+        #[cfg(windows)]
+        if autostart_changed && let Err(err) = selinga_platform::set_autostart(self.autostart) {
+            log_event(&format!("autostart change failed: {err}"));
+            self.notice = Some(format!("开机自启设置失败：{err}"));
+        }
         #[cfg(windows)]
         if hotkeys_changed {
             self.tray = Tray::new(&self.hotkeys).ok();
@@ -558,6 +571,12 @@ impl eframe::App for SelingaApp {
 
         if self.enforce_timeout() {
             ctx.request_repaint();
+        }
+
+        #[cfg(windows)]
+        if self.last_exclude.elapsed() > EXCLUDE_INTERVAL {
+            self.last_exclude = Instant::now();
+            selinga_platform::exclude_self_from_capture();
         }
 
         match self.phase {
@@ -646,11 +665,6 @@ impl SelingaApp {
                         self.select_bg = None;
                     }
                 }
-            }
-
-            if self.last_exclude.elapsed() > EXCLUDE_INTERVAL {
-                self.last_exclude = Instant::now();
-                selinga_platform::exclude_self_from_capture();
             }
 
             let outer = box_ctx.input(|i| i.viewport().outer_rect);
@@ -764,6 +778,11 @@ impl SelingaApp {
         let pointer = ctx.input(|i| i.pointer.clone());
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) || resp.secondary_clicked() {
+            log_event(&format!(
+                "select cancelled (escape={} secondary={})",
+                ctx.input(|i| i.key_pressed(egui::Key::Escape)),
+                resp.secondary_clicked()
+            ));
             self.finish_select(ctx, None);
             return;
         }
@@ -810,6 +829,7 @@ impl SelingaApp {
         if pointer.primary_released()
             && let Some((a, b)) = self.marquee.take()
         {
+            log_event("select finished by drag");
             self.finish_select(ctx, Some(egui::Rect::from_two_pos(a, b)));
         }
     }
@@ -827,11 +847,11 @@ impl SelingaApp {
             )
         });
         self.phase = Phase::Box;
-        eprintln!(
-            "selinga: t={:.0}ms finish_select valid={valid} rect={:?}",
-            self.t0.elapsed().as_millis(),
-            self.sel_rect
-        );
+        log_event(&format!(
+            "finish_select valid={valid} rect={:?} t={}ms",
+            self.sel_rect,
+            self.t0.elapsed().as_millis()
+        ));
         self.box_show_pending = true;
         self.box_pending_frames = 0;
         self.last_rect = None;
@@ -850,6 +870,11 @@ impl SelingaApp {
             egui::ViewportId::ROOT,
             egui::ViewportCommand::InnerSize(egui::vec2(1.0, 1.0)),
         );
+        #[cfg(windows)]
+        {
+            self.last_exclude = Instant::now();
+            selinga_platform::exclude_self_from_capture();
+        }
         eprintln!(
             "selinga: t={}ms root parked offscreen",
             self.t0.elapsed().as_millis()
@@ -1595,6 +1620,11 @@ impl SelingaApp {
             egui::ViewportCommand::InnerSize(egui::vec2(sw, sh)),
         );
         ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+        #[cfg(windows)]
+        {
+            self.last_exclude = Instant::now();
+            selinga_platform::exclude_self_from_capture();
+        }
         self.show_pending = true;
         self.pending_frames = 0;
         self.show_after_frames = 2;

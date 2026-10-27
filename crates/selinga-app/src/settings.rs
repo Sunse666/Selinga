@@ -2,14 +2,14 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub target_lang: String,
     pub display_mode: String,
     pub paused: bool,
-    #[serde(default = "VlmSettings::disabled")]
     pub vlm: VlmSettings,
-    #[serde(default)]
     pub hotkeys: HotkeySettings,
+    pub autostart: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +72,7 @@ impl Default for Settings {
             paused: false,
             vlm: VlmSettings::disabled(),
             hotkeys: HotkeySettings::default(),
+            autostart: false,
         }
     }
 }
@@ -109,7 +110,8 @@ impl Settings {
 
     pub fn load_from(path: &std::path::Path) -> Option<Self> {
         let text = std::fs::read_to_string(path).ok()?;
-        let mut settings: Settings = toml::from_str(&text).ok()?;
+        let text = text.trim_start_matches('\u{feff}');
+        let mut settings: Settings = toml::from_str(text).ok()?;
         if !KNOWN_LANGS.contains(&settings.target_lang.as_str()) {
             settings.target_lang = KNOWN_LANGS[0].to_owned();
         }
@@ -157,9 +159,33 @@ mod tests {
                 pause: "Ctrl+Shift+P".to_owned(),
                 reselect: "F4".to_owned(),
             },
+            autostart: true,
         };
         s.save_to(&path);
         assert_eq!(Settings::load_from(&path), Some(s));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn partial_file_falls_back_per_field() {
+        let path = temp_path("partial");
+        std::fs::write(&path, "autostart = true\n").unwrap();
+        let settings = Settings::load_from(&path).expect("partial file should parse");
+        assert!(settings.autostart);
+        assert_eq!(settings.target_lang, "zh-CN");
+        assert_eq!(settings.display_mode, "translation");
+        assert!(!settings.paused);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn utf8_bom_is_not_treated_as_corruption() {
+        let path = temp_path("bom");
+        let body =
+            "\u{feff}autostart = true\ntarget_lang = \"zh-CN\"\ndisplay_mode = \"translation\"\n";
+        std::fs::write(&path, body).unwrap();
+        let settings = Settings::load_from(&path).expect("BOM file should parse");
+        assert!(settings.autostart);
         let _ = std::fs::remove_file(&path);
     }
 

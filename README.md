@@ -9,6 +9,7 @@
 - **系统托盘 + 全局热键**：方框不在焦点也能控制
 - **设置持久化**：目标语言、显示模式、快捷键保存至 TOML
 - **单实例**：重复启动只会激活已运行的窗口
+- **开机自启（可选）**：`autostart = true` 写入 `HKCU\...\Run`，改回 `false` 即删除
 - **零依赖分发**：单文件可执行程序，无需安装运行时
 
 
@@ -46,9 +47,11 @@ cargo build --release -p selinga-app
 
 ## 设置
 
-配置文件位于 `%APPDATA%\selinga\settings.toml`（Windows）或 `~/.config/selinga/settings.toml`（Linux/macOS），程序运行时自动维护。
+配置文件位于 `%APPDATA%\selinga\settings.toml`，程序运行时自动维护。
 
 ```toml
+autostart = false                         # 开机自启
+
 [vlm]
 enabled = true
 base_url = "http://localhost:11434/v1"    # OpenAI 兼容端点，本地 Ollama 示例

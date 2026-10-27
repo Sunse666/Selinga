@@ -19,6 +19,8 @@
   中位行高 < 12px 的结果追加一轮 6x 变体。
 - **译文规整**：含中日文的行删除全部空格，纯拉丁行压缩连续空格；中文/全角标点统一转 ASCII。
 - **单实例**：重复启动会激活已运行的窗口后退出。
+- **开机自启**：`autostart = true` 写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，
+  改回 `false` 会删除该项；启动时按配置幂等同步，失败写日志并在角标提示。
 - **CHANGELOG**（本文件）。
 
 ### 变更
