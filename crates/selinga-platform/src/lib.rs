@@ -345,6 +345,60 @@ pub fn enable_utf8_console() {
     }
 }
 
+pub fn enable_per_monitor_dpi() {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::UI::HiDpi::{
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+        };
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
+
+pub fn virtual_screen_px() -> (i32, i32, u32, u32) {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+            SM_YVIRTUALSCREEN,
+        };
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1) as u32,
+            GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1) as u32,
+        )
+    }
+
+    #[cfg(not(windows))]
+    {
+        (0, 0, 1280, 720)
+    }
+}
+
+pub fn monitor_scale_at(x: i32, y: i32) -> f32 {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromPoint};
+        use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+
+        let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        let mut dpi_x = 96u32;
+        let mut dpi_y = 96u32;
+        if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y).is_ok() {
+            (dpi_x as f32 / 96.0).max(1.0)
+        } else {
+            1.0
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (x, y);
+        1.0
+    }
+}
 pub fn primary_screen_points() -> (f32, f32) {
     #[cfg(windows)]
     unsafe {
@@ -363,6 +417,7 @@ pub fn primary_screen_points() -> (f32, f32) {
     }
 }
 
+#[allow(dead_code)]
 pub fn primary_screen_px() -> (u32, u32) {
     #[cfg(windows)]
     unsafe {

@@ -97,6 +97,35 @@ impl DisplayMode {
     }
 }
 
+fn selection_region(marquee: egui::Rect, origin: (i32, i32), ppp: f32) -> selinga_capture::Region {
+    selinga_capture::Region {
+        x: origin.0 + (marquee.min.x * ppp).round() as i32,
+        y: origin.1 + (marquee.min.y * ppp).round() as i32,
+        w: (marquee.width() * ppp).round().max(1.0) as u32,
+        h: (marquee.height() * ppp).round().max(1.0) as u32,
+    }
+}
+
+fn region_to_logical(region: selinga_capture::Region, scale: f32) -> (egui::Pos2, egui::Vec2) {
+    let scale = scale.max(0.1);
+    (
+        egui::pos2(region.x as f32 / scale, region.y as f32 / scale),
+        egui::vec2(region.w as f32 / scale, region.h as f32 / scale),
+    )
+}
+
+fn default_region(ppp: f32) -> selinga_capture::Region {
+    let (pw, ph) = selinga_platform::primary_screen_px();
+    let w = (DEFAULT_SIZE[0] * ppp).round().max(1.0) as u32;
+    let h = (DEFAULT_SIZE[1] * ppp).round().max(1.0) as u32;
+    selinga_capture::Region {
+        x: ((pw as i32 - w as i32) / 2).max(0),
+        y: ((ph as i32 - h as i32) / 2).max(0),
+        w,
+        h,
+    }
+}
+
 fn display_mode_from(value: &str) -> DisplayMode {
     match value {
         "bilingual" => DisplayMode::Bilingual,
@@ -145,6 +174,7 @@ fn settings_mtime() -> Option<std::time::SystemTime> {
 }
 
 fn main() -> eframe::Result<()> {
+    selinga_platform::enable_per_monitor_dpi();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         log_event(&format!("panic: {info}"));
@@ -245,7 +275,7 @@ struct SelingaApp {
     autostart: bool,
     hidden: bool,
     phase: Phase,
-    sel_rect: Option<egui::Rect>,
+    sel_phys: Option<selinga_capture::Region>,
     marquee: Option<(egui::Pos2, egui::Pos2)>,
     show_pending: bool,
     pending_frames: u32,
@@ -334,7 +364,7 @@ impl SelingaApp {
             target_lang,
             hidden: false,
             phase: Phase::Select,
-            sel_rect: None,
+            sel_phys: None,
             marquee: None,
             show_pending: true,
             pending_frames: 0,
@@ -614,9 +644,12 @@ impl eframe::App for SelingaApp {
 
 impl SelingaApp {
     fn draw_box_viewport(&mut self, root_ctx: &egui::Context) {
-        let Some(sel) = self.sel_rect else {
+        let Some(sel) = self.sel_phys else {
             return;
         };
+        let scale =
+            selinga_platform::monitor_scale_at(sel.x + sel.w as i32 / 2, sel.y + sel.h as i32 / 2);
+        let (logical_pos, logical_size) = region_to_logical(sel, scale);
         let builder = egui::ViewportBuilder::default()
             .with_title("Selinga Box")
             .with_taskbar(false)
@@ -626,7 +659,7 @@ impl SelingaApp {
             .with_active(true)
             .with_visible(true)
             .with_position([-16000.0, -16000.0])
-            .with_inner_size(sel.size())
+            .with_inner_size(logical_size)
             .with_window_level(egui::WindowLevel::AlwaysOnTop);
         let root_ctx = root_ctx.clone();
         root_ctx.show_viewport_immediate(box_viewport_id(), builder, |ui, _class| {
@@ -651,7 +684,17 @@ impl SelingaApp {
                         "selinga: t={}ms box revealed",
                         self.t0.elapsed().as_millis()
                     );
-                    box_ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(sel.min));
+                    let placed = selinga_platform::set_window_geometry_px(
+                        "Selinga Box",
+                        sel.x,
+                        sel.y,
+                        sel.w as i32,
+                        sel.h as i32,
+                    );
+                    if !placed {
+                        box_ctx
+                            .send_viewport_cmd(egui::ViewportCommand::OuterPosition(logical_pos));
+                    }
                     box_ctx.request_repaint();
                 }
                 if f >= BOX_HANDOFF_AT_FRAME {
@@ -717,17 +760,20 @@ impl SelingaApp {
                 self.t0.elapsed().as_millis(),
                 self.pending_frames
             );
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
+            let (vx, vy, vw, vh) = selinga_platform::virtual_screen_px();
+            if !selinga_platform::set_window_geometry_px("Selinga", vx, vy, vw as i32, vh as i32) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
+            }
             ctx.request_repaint();
         }
     }
 
     #[cfg(windows)]
     fn capture_screen_texture(&self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
-        let (w, h) = selinga_platform::primary_screen_px();
+        let (x, y, w, h) = selinga_platform::virtual_screen_px();
         let capture = selinga_capture::win32::GdiCapture::new().ok()?;
         let frame = capture
-            .capture_region(selinga_capture::Region { x: 0, y: 0, w, h })
+            .capture_region(selinga_capture::Region { x, y, w, h })
             .ok()?;
         let image = egui::ColorImage::from_rgba_unmultiplied(
             [frame.width as usize, frame.height as usize],
@@ -812,7 +858,8 @@ impl SelingaApp {
                 egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0x8A, 0x81, 0xE8)),
                 egui::StrokeKind::Inside,
             );
-            let label = format!("{:.0} x {:.0}", sel.width(), sel.height());
+            let ppp = ctx.native_pixels_per_point().unwrap_or(1.0);
+            let label = format!("{:.0} x {:.0}", sel.width() * ppp, sel.height() * ppp);
             let label_pos = egui::pos2(
                 sel.left().clamp(rect.left() + 40.0, rect.right() - 40.0),
                 (sel.top() - 12.0).max(rect.top() + 10.0),
@@ -837,19 +884,17 @@ impl SelingaApp {
     fn finish_select(&mut self, ctx: &egui::Context, sel: Option<egui::Rect>) {
         self.marquee = None;
         let valid = sel.is_some_and(|r| r.width() >= MIN_SELECT && r.height() >= MIN_SELECT);
-        self.sel_rect = Some(if valid {
-            sel.unwrap_or(egui::Rect::ZERO)
+        let ppp = ctx.native_pixels_per_point().unwrap_or(1.0);
+        let (vx, vy, _, _) = selinga_platform::virtual_screen_px();
+        self.sel_phys = Some(if valid {
+            selection_region(sel.unwrap_or(egui::Rect::ZERO), (vx, vy), ppp)
         } else {
-            let (sw, sh) = selinga_platform::primary_screen_points();
-            egui::Rect::from_min_size(
-                egui::pos2((sw - DEFAULT_SIZE[0]) * 0.5, (sh - DEFAULT_SIZE[1]) * 0.5),
-                egui::Vec2::from(DEFAULT_SIZE),
-            )
+            default_region(ppp)
         });
         self.phase = Phase::Box;
         log_event(&format!(
-            "finish_select valid={valid} rect={:?} t={}ms",
-            self.sel_rect,
+            "finish_select valid={valid} region={:?} t={}ms",
+            self.sel_phys,
             self.t0.elapsed().as_millis()
         ));
         self.box_show_pending = true;
@@ -1594,7 +1639,7 @@ impl SelingaApp {
     #[cfg(windows)]
     fn enter_select_mode(&mut self, ctx: &egui::Context) {
         self.phase = Phase::Select;
-        self.sel_rect = None;
+        self.sel_phys = None;
         self.marquee = None;
         self.hidden = false;
         self.last_rect = None;
@@ -1614,11 +1659,14 @@ impl SelingaApp {
             }
         }
         ctx.send_viewport_cmd_to(box_viewport_id(), egui::ViewportCommand::Visible(false));
-        let (sw, sh) = selinga_platform::primary_screen_points();
-        ctx.send_viewport_cmd_to(
-            egui::ViewportId::ROOT,
-            egui::ViewportCommand::InnerSize(egui::vec2(sw, sh)),
-        );
+        let (vx, vy, vw, vh) = selinga_platform::virtual_screen_px();
+        if !selinga_platform::set_window_geometry_px("Selinga", vx, vy, vw as i32, vh as i32) {
+            let (sw, sh) = selinga_platform::primary_screen_points();
+            ctx.send_viewport_cmd_to(
+                egui::ViewportId::ROOT,
+                egui::ViewportCommand::InnerSize(egui::vec2(sw, sh)),
+            );
+        }
         ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
         #[cfg(windows)]
         {
@@ -2170,6 +2218,42 @@ mod tests {
     #[test]
     fn never_triggered_box_stays_idle() {
         assert_eq!(trigger_decision(idle()), None);
+    }
+
+    #[test]
+    fn selection_region_maps_points_to_physical() {
+        let marquee = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(300.0, 200.0));
+        let region = selection_region(marquee, (-1920, 0), 1.5);
+        assert_eq!(region.x, -1770);
+        assert_eq!(region.y, 75);
+        assert_eq!(region.w, 450);
+        assert_eq!(region.h, 300);
+    }
+
+    #[test]
+    fn region_to_logical_uses_the_monitor_scale() {
+        let region = selinga_capture::Region {
+            x: 1920,
+            y: 0,
+            w: 400,
+            h: 300,
+        };
+        let (pos, size) = region_to_logical(region, 2.0);
+        assert_eq!(pos, egui::pos2(960.0, 0.0));
+        assert_eq!(size, egui::vec2(200.0, 150.0));
+    }
+
+    #[test]
+    fn selection_and_placement_round_trip() {
+        let region = selinga_capture::Region {
+            x: -500,
+            y: 120,
+            w: 640,
+            h: 480,
+        };
+        let (pos, size) = region_to_logical(region, 1.25);
+        let back = selection_region(egui::Rect::from_min_size(pos, size), (0, 0), 1.25);
+        assert_eq!(back, region);
     }
 
     #[test]
