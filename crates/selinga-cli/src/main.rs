@@ -29,8 +29,6 @@ enum Cmd {
         translate: bool,
         #[arg(long)]
         tl: Option<String>,
-        /// OCR engine: "win" (Windows.Media.Ocr, default) or "vlm"
-        /// (OpenAI-compatible vision model, reads [vlm] from settings.toml).
         #[arg(long = "engine", default_value = "win")]
         engine: String,
     },
@@ -155,8 +153,6 @@ fn run_capture_ocr(
     }
 }
 
-/// Read [vlm] from the same settings.toml the app uses and build an
-/// endpoint. Requires enabled = true plus non-empty base_url and model.
 fn load_vlm_endpoint() -> Result<selinga_ocr::vlm::VlmEndpoint, String> {
     #[derive(serde::Deserialize)]
     struct VlmSection {
