@@ -30,6 +30,9 @@
 - **双语模式布局**：遮罩不再向下撑高，两行都落在原行框内（此前会盖住下一行的译文）。
 - **任务栏**：两个窗口都不再占用任务栏按钮（`ITaskbarList::DeleteTab`）。
 - **CLI**：所有参数补 `help` 文本（`--engine` 恢复 win/vlm 说明）。
+- **CI 与发布均只跑 Windows**：Linux/macOS 功能尚未实现，CI 不再覆盖这两平台，Release 也只产出
+  `selinga.exe`。副作用：`#[cfg(not(windows))]` 分支目前没有任何编译守卫，等这两平台开工时再把
+  CI 的 matrix 加回去。
 - 删除空的 `selinga-overlay-ui` crate（workspace 现为 7 个 crate）。
 
 ### 修复

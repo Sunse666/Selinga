@@ -8,10 +8,13 @@ on:
 
 jobs:
   test:
+    # Windows only while the other platforms have no implementation. Note that
+    # this also means the #[cfg(not(windows))] branches are no longer compile-
+    # checked anywhere; re-add ubuntu/macos here when that work starts.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
