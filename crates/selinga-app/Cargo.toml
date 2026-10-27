@@ -17,8 +17,12 @@ selinga-translate.workspace = true
 selinga-platform.workspace = true
 selinga-pipeline.workspace = true
 eframe.workspace = true
+png.workspace = true
 serde.workspace = true
 toml.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 global-hotkey = "0.8.0"

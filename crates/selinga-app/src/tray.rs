@@ -58,8 +58,11 @@ impl Tray {
             &item_quit,
         ])
         .map_err(|e| e.to_string())?;
-
-        let icon = tray_icon::Icon::from_rgba(icon_rgba(32), 32, 32).map_err(|e| e.to_string())?;
+        let icon = match crate::app_icon() {
+            Some((rgba, width, height)) => tray_icon::Icon::from_rgba(rgba, width, height),
+            None => tray_icon::Icon::from_rgba(icon_rgba(32), 32, 32),
+        }
+        .map_err(|e| e.to_string())?;
         let tray = TrayIconBuilder::new()
             .with_tooltip("Selinga")
             .with_icon(icon)

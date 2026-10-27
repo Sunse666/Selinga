@@ -2710,10 +2710,11 @@ checksum = "2ab42ca02749e120097e328d91d415325bdf43b1c72c4c8badf37375fe40a813"
 
 [[package]]
 name = "selinga-app"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "eframe",
  "global-hotkey",
+ "png 0.17.16",
  "selinga-capture",
  "selinga-ocr",
  "selinga-pipeline",
@@ -2723,11 +2724,12 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "tray-icon",
  "windows",
+ "winresource",
 ]
 
 [[package]]
 name = "selinga-capture"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "thiserror 2.0.21",
  "windows",
@@ -2735,7 +2737,7 @@ dependencies = [
 
 [[package]]
 name = "selinga-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "selinga-capture",
@@ -2748,7 +2750,7 @@ dependencies = [
 
 [[package]]
 name = "selinga-ocr"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "png 0.17.16",
@@ -2761,7 +2763,7 @@ dependencies = [
 
 [[package]]
 name = "selinga-pipeline"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "selinga-capture",
  "selinga-ocr",
@@ -2770,14 +2772,14 @@ dependencies = [
 
 [[package]]
 name = "selinga-platform"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "windows",
 ]
 
 [[package]]
 name = "selinga-translate"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde_json",
  "thiserror 2.0.21",
@@ -3166,6 +3168,21 @@ dependencies = [
  "toml_parser",
  "toml_writer",
  "winnow 0.7.15",
+]
+
+[[package]]
+name = "toml"
+version = "1.1.8+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20489e00e4d8741d6be680764cc12e270655e375a20d1011e844a9c3379e678d"
+dependencies = [
+ "indexmap",
+ "serde_core",
+ "serde_spanned 1.1.2",
+ "toml_datetime 1.1.2+spec-1.1.0",
+ "toml_parser",
+ "toml_writer",
+ "winnow 1.0.4",
 ]
 
 [[package]]
@@ -4178,6 +4195,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "winresource"
+version = "0.1.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2bc6d36480b829272a5bdabf08e6dca8004761c1da7e35efef800540c66221b"
+dependencies = [
+ "toml 1.1.8+spec-1.1.0",
+ "version_check",
 ]
 
 [[package]]

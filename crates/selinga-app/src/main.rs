@@ -185,18 +185,26 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
     let (screen_w, screen_h) = selinga_platform::primary_screen_points();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Selinga")
+        .with_taskbar(false)
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_resizable(true)
+        .with_active(true)
+        .with_visible(true)
+        .with_inner_size([screen_w, screen_h])
+        .with_position([-16000.0, -16000.0])
+        .with_window_level(egui::WindowLevel::AlwaysOnTop);
+    if let Some((rgba, width, height)) = app_icon() {
+        viewport = viewport.with_icon(std::sync::Arc::new(egui::IconData {
+            rgba,
+            width,
+            height,
+        }));
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Selinga")
-            .with_taskbar(false)
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_resizable(true)
-            .with_active(true)
-            .with_visible(true)
-            .with_inner_size([screen_w, screen_h])
-            .with_position([-16000.0, -16000.0])
-            .with_window_level(egui::WindowLevel::AlwaysOnTop),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -208,6 +216,20 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(SelingaApp::new(&cc.egui_ctx)))
         }),
     )
+}
+
+fn app_icon() -> Option<(Vec<u8>, u32, u32)> {
+    let bytes = include_bytes!("../assets/selinga.png");
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes.as_slice()));
+    decoder.set_transformations(png::Transformations::EXPAND);
+    let mut reader = decoder.read_info().ok()?;
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buffer).ok()?;
+    buffer.truncate(info.buffer_size());
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    Some((buffer, info.width, info.height))
 }
 
 fn install_cjk_fonts(ctx: &egui::Context) {
@@ -2218,6 +2240,14 @@ mod tests {
     #[test]
     fn never_triggered_box_stays_idle() {
         assert_eq!(trigger_decision(idle()), None);
+    }
+
+    #[test]
+    fn embedded_icon_decodes_to_rgba() {
+        let (rgba, width, height) = app_icon().expect("icon.png must decode");
+        assert_eq!(width, 256);
+        assert_eq!(height, 256);
+        assert_eq!(rgba.len(), (width * height * 4) as usize);
     }
 
     #[test]
