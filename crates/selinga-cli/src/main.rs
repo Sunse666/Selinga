@@ -8,7 +8,11 @@ use selinga_ocr::Ocr;
 use selinga_translate::Translator;
 
 #[derive(Parser)]
-#[command(name = "selinga-cli", version, about = "Selinga M0 debug CLI")]
+#[command(
+    name = "selinga-cli",
+    version,
+    about = "Selinga debug CLI: capture a screen region, OCR it, inspect or translate the result"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -16,20 +20,31 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    #[command(about = "Capture a screen region, OCR it, and optionally translate")]
     CaptureOcr {
-        #[arg(long = "region")]
+        #[arg(
+            long = "region",
+            help = "Region to capture, as x,y,w,h in screen pixels"
+        )]
         region: String,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "OCR language tag such as zh-CN (default: system languages, then zh-CN, en-US)"
+        )]
         lang: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Also print each word's bounding box")]
         boxes: bool,
-        #[arg(long)]
+        #[arg(long, help = "Write the captured frame to this BMP path")]
         dump: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Translate the recognised lines with the fallback chain")]
         translate: bool,
-        #[arg(long)]
+        #[arg(long, help = "Target language for --translate (default: zh-CN)")]
         tl: Option<String>,
-        #[arg(long = "engine", default_value = "win")]
+        #[arg(
+            long = "engine",
+            default_value = "win",
+            help = "OCR engine: \"win\" (Windows.Media.Ocr, default) or \"vlm\" (OpenAI-compatible vision model, reads [vlm] from settings.toml)"
+        )]
         engine: String,
     },
 }
